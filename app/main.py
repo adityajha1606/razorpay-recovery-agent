@@ -123,6 +123,34 @@ async def startup_event():
     asyncio.create_task(_periodic_throttle_release())
 
 
+def get_leader_name() -> Optional[str]:
+    """Return the current etcd leader's node name, or None if unavailable."""
+    if not USE_ETCD:
+        return None
+    try:
+        member_id_to_name = {str(m.id): m.name for m in etcd_client.members}
+        result = subprocess.run(
+            [
+                "docker", "compose", "exec", "-T", "etcd1",
+                "etcdctl", "endpoint", "status", "--write-out=json", "--cluster",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        statuses = json.loads(result.stdout)
+        leader_id = None
+        for status in statuses:
+            leader_id = status.get("Status", {}).get("leader")
+            if leader_id:
+                break
+        if leader_id:
+            return member_id_to_name.get(str(leader_id))
+    except Exception as exc:
+        logger.warning("Leader detection failed: %s", exc)
+    return None
+
+
 def _not_implemented(section: str) -> HTTPException:
     return HTTPException(
         status_code=501,
@@ -167,10 +195,7 @@ async def webhook_payment_failed(request: Request) -> dict:
 
     notes = payload.get("payload", {}).get("payment", {}).get("entity", {}).get("notes") or {}
     mandate_id = notes.get("mandate_id")
-    if not mandate_id:
-        raise HTTPException(status_code=400, detail="Mandatory mandate_id missing in notes")
-
-    existing_case = store.find_case_by_mandate(mandate_id)
+    existing_case = store.find_case_by_mandate(mandate_id) if mandate_id else None
 
     try:
         event = parse_payment_failed(
@@ -292,10 +317,7 @@ async def simulate_failure(req: SimulateFailureRequest) -> dict:
     }
     notes = req.notes or {}
     mandate_id = notes.get("mandate_id")
-    if not mandate_id:
-        raise HTTPException(status_code=400, detail="Missing mandate_id in notes")
-
-    existing_case = store.find_case_by_mandate(mandate_id)
+    existing_case = store.find_case_by_mandate(mandate_id) if mandate_id else None
     try:
         event = parse_payment_failed(
             payload,
@@ -665,6 +687,12 @@ def dashboard_metrics() -> dict:
     at_risk_count = sum(1 for c in cases if c.state in ("NOTICE_PENDING", "RETRY_SCHEDULED", "THROTTLED"))
     escalated_count = sum(1 for c in cases if c.state == "ESCALATED")
 
+    total_treatment = sum(1 for c in cases if c.bucket == "treatment")
+    total_control = sum(1 for c in cases if c.bucket == "control")
+    treatment_recovery_rate = (agent_recovered_count / total_treatment) if total_treatment else 0.0
+    control_recovery_rate = (control_recovered_count / total_control) if total_control else 0.0
+    incremental_rate = treatment_recovery_rate - control_recovery_rate
+
     return {
         "agent_recovered_count": agent_recovered_count,
         "agent_recovered_paise": agent_recovered_paise,
@@ -675,6 +703,9 @@ def dashboard_metrics() -> dict:
         "control_still_failed_count": control_still_failed_count,
         "at_risk_count": at_risk_count,
         "escalated_count": escalated_count,
+        "treatment_recovery_rate": treatment_recovery_rate,
+        "control_recovery_rate": control_recovery_rate,
+        "incremental_recovery_rate": incremental_rate,
         "compliance_score": 100.0,
     }
 
@@ -698,6 +729,9 @@ def dashboard_page() -> str:
             document.getElementById('control_fail_count').innerText = data.control_still_failed_count;
             document.getElementById('at_risk').innerText = data.at_risk_count;
             document.getElementById('escalated').innerText = data.escalated_count;
+            document.getElementById('treatment_rate').innerText = (data.treatment_recovery_rate * 100).toFixed(1) + '%';
+            document.getElementById('control_rate').innerText = (data.control_recovery_rate * 100).toFixed(1) + '%';
+            document.getElementById('incremental_rate').innerText = (data.incremental_recovery_rate * 100).toFixed(1) + '%';
             document.getElementById('compliance').innerText = data.compliance_score;
           }
           setInterval(refresh, 1000);
@@ -716,6 +750,9 @@ def dashboard_page() -> str:
           <li>Control Still Failed: <span id="control_fail_count">0</span></li>
           <li>At Risk: <span id="at_risk">0</span></li>
           <li>Escalated: <span id="escalated">0</span></li>
+          <li>Treatment Recovery Rate: <span id="treatment_rate">0%</span></li>
+          <li>Control Recovery Rate: <span id="control_rate">0%</span></li>
+          <li>Incremental Recovery Rate: <span id="incremental_rate">0%</span></li>
           <li>Compliance Score: <span id="compliance">100</span>%</li>
         </ul>
       </body>
@@ -731,40 +768,13 @@ def chaos_kill_leader() -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Chaos endpoints are demo-only")
     if USE_ETCD:
-        try:
-            # Map member ID to name using etcd3 Python client
-            member_id_to_name = {str(m.id): m.name for m in etcd_client.members}
-
-            # Get leader ID from etcdctl endpoint status
-            result = subprocess.run(
-                [
-                    "docker", "compose", "exec", "-T", "etcd1",
-                    "etcdctl", "endpoint", "status", "--write-out=json", "--cluster",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            statuses = json.loads(result.stdout)
-            leader_id = None
-            for status in statuses:
-                leader_id = status.get("Status", {}).get("leader")
-                if leader_id:
-                    break
-
-            if leader_id is None:
-                raise ValueError("Leader ID not found in etcdctl output")
-
-            leader_name = member_id_to_name.get(str(leader_id))
-            if leader_name is None:
-                raise ValueError(f"Leader ID {leader_id} not found in members")
-
+        leader_name = get_leader_name()
+        if leader_name:
             subprocess.run(["docker", "compose", "stop", leader_name], check=False)
             return {"status": "killed", "message": f"Stopped {leader_name}; new leader should be elected."}
-        except Exception as exc:
-            logger.warning("Leader detection failed, stopping etcd3 as fallback: %s", exc)
+        else:
             subprocess.run(["docker", "compose", "stop", "etcd3"], check=False)
-            return {"status": "killed", "message": "Stopped etcd3; new leader should be elected."}
+            return {"status": "killed", "message": "Stopped etcd3; leader detection failed, new leader should be elected."}
     return {"status": "simulated", "message": "Leader kill simulated; new leader would be elected."}
 
 
@@ -779,11 +789,13 @@ def chaos_spike() -> dict:
 def cluster_status() -> dict:
     if USE_ETCD:
         members = etcd_client.members
+        leader_name = get_leader_name()
         return {
             "nodes": [
                 {"id": str(m.id), "name": m.name, "peer_urls": list(m.peer_urls)}
                 for m in members
             ],
+            "leader": leader_name,
             "using_real_etcd": True,
         }
     return {
@@ -792,5 +804,6 @@ def cluster_status() -> dict:
             {"id": "etcd2", "state": "follower", "healthy": True},
             {"id": "etcd3", "state": "follower", "healthy": True},
         ],
+        "leader": "etcd1",
         "using_real_etcd": False,
     }

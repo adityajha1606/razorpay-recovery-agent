@@ -129,7 +129,7 @@ class StateMachine:
 
         case = RecoveryCase(
             case_id=event.case_id,
-            mandate_id=event.mandate_id or "",
+            mandate_id=event.mandate_id or event.case_id,
             instrument_id=event.instrument_id,
             original_amount=event.amount,
             opened_at=now,
