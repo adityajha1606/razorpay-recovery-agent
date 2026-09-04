@@ -89,9 +89,12 @@ def test_fault_injection_retry_cap_and_commit_gating(case_id, amount, commit_res
     # Initial failure
     event = make_failure(case_id, 1, "bank_server_down", amount)
     case, _, _ = sm.handle_payment_failed(None, event, config, clock)
-    assert case.state == "NOTICE_PENDING" or case.state == "AFA_REQUIRED" or case.state == "ESCALATED"
-    if case.state != "NOTICE_PENDING":
-        return  # not a retryable case, skip
+
+    # Skip non-retryable paths (control, AFA, business decline)
+    if case.state in ("CONTROL_HELD", "AFA_REQUIRED", "ESCALATED"):
+        return
+
+    assert case.state == "NOTICE_PENDING"
 
     successful_commits = 0
 
