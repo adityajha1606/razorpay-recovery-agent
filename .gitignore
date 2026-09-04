@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.hypothesis/
+
+# Env / secrets
+.env
+
+# Claude Code worktrees (see CLAUDE.md "Working style")
+.claude/worktrees/
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,74 @@
+# Builder doc §3: Postgres (outbox fallback + case state, §10.3) and a
+# 3-node etcd cluster (quorum layer, §10.1). Bring up only what you need:
+#
+#   docker compose up postgres          # Phase 1 default backend
+#   docker compose up etcd1 etcd2 etcd3  # Phase 2, once the spike has passed
+#
+# For the leader-kill demo beat (§12 step 6): `docker compose stop etcd1`
+# (or whichever node is currently leader — check GET /cluster/status) and
+# watch a new leader get elected among the remaining two.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: recovery
+      POSTGRES_PASSWORD: recovery
+      POSTGRES_DB: recovery
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recovery"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  etcd1:
+    image: quay.io/coreos/etcd:v3.5.9
+    command:
+      - etcd
+      - --name=etcd1
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=recovery-etcd-cluster
+    ports:
+      - "2379:2379" # client port for the host-side etcd3 Python client
+
+  etcd2:
+    image: quay.io/coreos/etcd:v3.5.9
+    command:
+      - etcd
+      - --name=etcd2
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=recovery-etcd-cluster
+    ports:
+      - "2389:2379"
+
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.9
+    command:
+      - etcd
+      - --name=etcd3
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=recovery-etcd-cluster
+    ports:
+      - "2399:2379"
+
+volumes:
+  postgres-data:

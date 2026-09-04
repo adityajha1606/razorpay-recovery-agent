@@ -1,0 +1,36 @@
+npci_rules:
+  max_retries: 3
+  notice_lead_time: 24h
+  spacing:
+    - 0h
+    - 72h
+    - 168h
+  control_observation_window: 72h
+  max_schedule_window: 48h
+  peak_windows:
+    - start: "10:00"
+      end: "13:00"
+    - start: "17:00"
+      end: "21:30"
+  afa_free_ceiling: 1500000
+
+profiles:
+  prod:
+    time_scale: 1x
+  demo:
+    time_scale: 3600x
+
+decline_rules:
+  technical:
+    - bank_server_down
+    - network_timeout
+    - upi_timeout
+    - issuer_unavailable
+    - payment_authorization_failed
+  business:
+    - insufficient_funds
+    - blocked_account
+    - invalid_mandate
+    - payment_limit_exceeded
+    - payment_failed
+  default: business
