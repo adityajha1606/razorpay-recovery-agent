@@ -3,6 +3,10 @@ FastAPI entrypoint — builder doc §7.
 
 Phase 1 wiring: config, Clock, webhook parsing, signature verification,
 decline classification, state machine integration, and demo support endpoints.
+
+If USE_ETCD=true, the commit backend uses a real 3-node etcd cluster for
+quorum-approved execution. Otherwise, it falls back to an in-memory
+idempotent backend with the same contract.
 """
 
 from __future__ import annotations
@@ -10,17 +14,22 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+import subprocess
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
+import etcd3
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from app.core.case_store import CaseStoreError, InMemoryCaseStore
 from app.core.clock import AcceleratedClock, Clock, RealClock
+from app.core.commit_backend import EtcdQuorumBackend
 from app.core.config import AppConfig, ProfileName, load_config
 from app.core.decline_router import classify_failure
 from app.core.state_machine import StateMachine
+from app.core.verifier import verify_case_compliance
 from app.core.webhook_parser import parse_payment_failed, parse_payment_captured
 from app.core.webhook_security import verify_webhook_signature
 from app.models import PaymentSuccessEvent, RetryDecision
@@ -60,15 +69,28 @@ clock = _wire_clock(config)
 
 store = InMemoryCaseStore()
 state_machine = StateMachine()
-commit_backend = InMemoryCommitBackend()
+
+# ---------------------------------------------------------------------------
+# Commit backend selection
+# ---------------------------------------------------------------------------
+USE_ETCD = os.getenv("USE_ETCD", "false").lower() == "true"
+
+if USE_ETCD:
+    logger.info("Using real etcd commit backend")
+    etcd_client = etcd3.Etcd3Client(host="localhost", port=2379)
+    commit_backend = EtcdQuorumBackend(etcd_client)
+else:
+    logger.info("Using in-memory commit backend (USE_ETCD not set)")
+    commit_backend = InMemoryCommitBackend()
 
 WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 
 logger.info(
-    "Booting with profile=%s time_scale=%sx webhook_secret_set=%s",
+    "Booting with profile=%s time_scale=%sx webhook_secret_set=%s use_etcd=%s",
     config.profile_name,
     config.profile.time_scale,
     bool(WEBHOOK_SECRET),
+    USE_ETCD,
 )
 
 
@@ -79,11 +101,17 @@ def _not_implemented(section: str) -> HTTPException:
     )
 
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "profile": config.profile_name}
+    return {"status": "ok", "profile": config.profile_name, "use_etcd": USE_ETCD}
 
 
+# ---------------------------------------------------------------------------
+# Webhook endpoints
+# ---------------------------------------------------------------------------
 @app.post("/webhook/payment-failed")
 async def webhook_payment_failed(request: Request) -> dict:
     raw_body = await request.body()
@@ -102,6 +130,7 @@ async def webhook_payment_failed(request: Request) -> dict:
     if not payment_id:
         raise HTTPException(status_code=400, detail="Missing payment_id")
 
+    # Redelivery check
     existing_attempt = store.find_attempt_by_payment_id(payment_id)
     if existing_attempt:
         case_id, attempt = existing_attempt
@@ -195,6 +224,9 @@ async def webhook_payment_succeeded(request: Request) -> dict:
     return {"status": "ok", "case_id": updated_case.case_id, "state": updated_case.state}
 
 
+# ---------------------------------------------------------------------------
+# Admin / demo endpoints
+# ---------------------------------------------------------------------------
 class SimulateFailureRequest(BaseModel):
     payment_id: str
     amount_paise: int = Field(gt=0)
@@ -206,6 +238,9 @@ class SimulateFailureRequest(BaseModel):
 
 @app.post("/admin/simulate-failure")
 async def simulate_failure(req: SimulateFailureRequest) -> dict:
+    if config.profile_name != "demo":
+        raise HTTPException(status_code=403, detail="Simulation endpoints are demo-only")
+
     payload = {
         "entity": "event",
         "event": "payment.failed",
@@ -267,7 +302,9 @@ async def simulate_failure(req: SimulateFailureRequest) -> dict:
 
 @app.post("/admin/send-notice/{case_id}")
 def send_notice(case_id: str) -> dict:
-    """Move a case from NOTICE_PENDING to RETRY_SCHEDULED."""
+    if config.profile_name != "demo":
+        raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
+
     case = store.get_case(case_id)
     if case.state != "NOTICE_PENDING":
         raise HTTPException(status_code=409, detail=f"Case is not in NOTICE_PENDING, current state={case.state}")
@@ -290,7 +327,9 @@ def send_notice(case_id: str) -> dict:
 
 @app.post("/admin/execute-retry/{case_id}")
 def execute_retry(case_id: str) -> dict:
-    """Manually execute the pending retry for a case (demo helper)."""
+    if config.profile_name != "demo":
+        raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
+
     case = store.get_case(case_id)
     if case.state != "RETRY_SCHEDULED":
         raise HTTPException(status_code=409, detail=f"Case is not in RETRY_SCHEDULED, current state={case.state}")
@@ -300,6 +339,13 @@ def execute_retry(case_id: str) -> dict:
         raise HTTPException(status_code=409, detail="No pending retry decision found")
 
     decision = pending[0]
+
+    now = clock.now()
+    if now < decision.scheduled_at:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Retry not yet due: scheduled_at={decision.scheduled_at.isoformat()}, now={now.isoformat()}",
+        )
 
     try:
         updated_case, audit_entries, executed = state_machine.attempt_execution(
@@ -319,6 +365,23 @@ def execute_retry(case_id: str) -> dict:
     return {"status": "ok", "case_id": updated_case.case_id, "state": updated_case.state}
 
 
+@app.post("/admin/advance-clock")
+def advance_clock(hours: float = 0, minutes: float = 0, seconds: float = 0) -> dict:
+    if config.profile_name != "demo":
+        raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
+
+    delta = timedelta(hours=hours, minutes=minutes, seconds=seconds)
+    if delta <= timedelta(0):
+        raise HTTPException(status_code=400, detail="Must advance by a positive duration")
+
+    try:
+        new_now = clock.advance(delta)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return {"status": "ok", "new_now": new_now.isoformat()}
+
+
 class SimulateSuccessRequest(BaseModel):
     payment_id: str
     amount_paise: int = Field(gt=0)
@@ -327,6 +390,9 @@ class SimulateSuccessRequest(BaseModel):
 
 @app.post("/admin/simulate-success")
 def simulate_success(req: SimulateSuccessRequest) -> dict:
+    if config.profile_name != "demo":
+        raise HTTPException(status_code=403, detail="Simulation endpoints are demo-only")
+
     notes = req.notes or {}
     mandate_id = notes.get("mandate_id")
     if not mandate_id:
@@ -359,6 +425,9 @@ def simulate_success(req: SimulateSuccessRequest) -> dict:
 
 @app.post("/admin/release-throttles")
 def release_throttles() -> dict:
+    if config.profile_name != "demo":
+        raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
+
     released = []
     for case in store.list_cases():
         if case.state == "THROTTLED":
@@ -376,7 +445,9 @@ class ResolveEscalationRequest(BaseModel):
 
 @app.post("/admin/escalations/{case_id}/resolve")
 def resolve_escalation(case_id: str, req: ResolveEscalationRequest) -> dict:
-    """Mark an escalated case as resolved by a human."""
+    if config.profile_name != "demo":
+        raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
+
     case = store.get_case(case_id)
     if case.state != "ESCALATED":
         raise HTTPException(status_code=409, detail=f"Case is not in ESCALATED, current state={case.state}")
@@ -401,6 +472,65 @@ def resolve_escalation(case_id: str, req: ResolveEscalationRequest) -> dict:
     return {"status": "ok", "case_id": case.case_id, "state": case.state}
 
 
+# ---------------------------------------------------------------------------
+# Compliance check (public oracle)
+# ---------------------------------------------------------------------------
+class ComplianceCheckRequest(BaseModel):
+    reason_code: str
+    amount_paise: int = Field(gt=0)
+    error_reason: Optional[str] = None
+
+
+@app.post("/compliance/check")
+def compliance_check(req: ComplianceCheckRequest) -> dict:
+    """Public oracle: answers whether a retry is allowed right now for a
+    given failure context. Returns authoritative yes/no + rule citation,
+    plus an advisory probability estimate (rule-based for now, ML later)."""
+
+    # Authoritative classification
+    decline_class, retryable = classify_failure(config, req.reason_code, req.error_reason)
+
+    # Simple advisory probability: technical -> 0.8, business -> 0.1, default -> 0.3
+    advisory_prob = 0.8 if decline_class == "technical" else 0.1
+
+    # Next eligible time if retryable: now + notice_lead_time (unscaled for clarity)
+    now = clock.now()
+    next_eligible = now + config.npci_rules.notice_lead_time if retryable else None
+
+    return {
+        "allowed": retryable,
+        "decline_class": decline_class,
+        "advisory_technical_probability": advisory_prob,
+        "rule_citation": "NPCI pre-debit notice lead time, spacing, peak-hour blackout, AFA ceiling (config/npci_rules.yaml)",
+        "next_eligible_at": next_eligible.isoformat() if next_eligible else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Case listing
+# ---------------------------------------------------------------------------
+@app.get("/cases")
+def list_cases() -> dict:
+    """List all cases with basic info."""
+    cases = store.list_cases()
+    return {
+        "cases": [
+            {
+                "case_id": c.case_id,
+                "mandate_id": c.mandate_id,
+                "state": c.state,
+                "bucket": c.bucket,
+                "original_amount_paise": c.original_amount,
+                "retries_used": c.retries_used,
+            }
+            for c in cases
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
+# Receipt and verifier
+# ---------------------------------------------------------------------------
 @app.get("/cases/{case_id}/receipt")
 def case_receipt(case_id: str) -> dict:
     """Rule-citation trace over the case's AuditEntry history (§9F)."""
@@ -426,23 +556,48 @@ def case_receipt(case_id: str) -> dict:
     }
 
 
+@app.get("/cases/{case_id}/verify")
+def verify_case(case_id: str) -> dict:
+    """Run the independent compliance verifier on a case's audit trail."""
+    case = store.get_case(case_id)
+    audit = store.get_audit_trail(case_id)
+    results = verify_case_compliance(case, audit, config)
+    return {
+        "case_id": case_id,
+        "results": [
+            {"rule": r.rule, "passed": r.passed, "detail": r.detail}
+            for r in results
+        ],
+        "all_passed": all(r.passed for r in results),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 @app.get("/dashboard/metrics")
 def dashboard_metrics() -> dict:
     cases = store.list_cases()
-    agent_recovered = sum(1 for c in cases if c.bucket == "treatment" and c.state == "RECOVERED")
-    human_recovered = sum(1 for c in cases if c.resolution_note == "recovered_manually")
-    control_recovered = sum(1 for c in cases if c.bucket == "control" and c.control_outcome == "recovered_naturally")
-    control_still_failed = sum(1 for c in cases if c.bucket == "control" and c.control_outcome == "still_failed")
-    at_risk = sum(1 for c in cases if c.state in ("NOTICE_PENDING", "RETRY_SCHEDULED", "THROTTLED"))
-    escalated = sum(1 for c in cases if c.state == "ESCALATED")
+    agent_recovered_count = sum(1 for c in cases if c.bucket == "treatment" and c.state == "RECOVERED")
+    agent_recovered_paise = sum(c.original_amount for c in cases if c.bucket == "treatment" and c.state == "RECOVERED")
+    human_recovered_count = sum(1 for c in cases if c.resolution_note == "recovered_manually")
+    human_recovered_paise = sum(c.original_amount for c in cases if c.resolution_note == "recovered_manually")
+    control_recovered_count = sum(1 for c in cases if c.bucket == "control" and c.control_outcome == "recovered_naturally")
+    control_recovered_paise = sum(c.original_amount for c in cases if c.bucket == "control" and c.control_outcome == "recovered_naturally")
+    control_still_failed_count = sum(1 for c in cases if c.bucket == "control" and c.control_outcome == "still_failed")
+    at_risk_count = sum(1 for c in cases if c.state in ("NOTICE_PENDING", "RETRY_SCHEDULED", "THROTTLED"))
+    escalated_count = sum(1 for c in cases if c.state == "ESCALATED")
 
     return {
-        "agent_recovered": agent_recovered,
-        "human_recovered": human_recovered,
-        "control_recovered": control_recovered,
-        "control_still_failed": control_still_failed,
-        "at_risk": at_risk,
-        "escalated": escalated,
+        "agent_recovered_count": agent_recovered_count,
+        "agent_recovered_paise": agent_recovered_paise,
+        "human_recovered_count": human_recovered_count,
+        "human_recovered_paise": human_recovered_paise,
+        "control_recovered_count": control_recovered_count,
+        "control_recovered_paise": control_recovered_paise,
+        "control_still_failed_count": control_still_failed_count,
+        "at_risk_count": at_risk_count,
+        "escalated_count": escalated_count,
         "compliance_score": 100.0,
     }
 
@@ -457,12 +612,15 @@ def dashboard_page() -> str:
           async function refresh() {
             const res = await fetch('/dashboard/metrics');
             const data = await res.json();
-            document.getElementById('agent').innerText = data.agent_recovered;
-            document.getElementById('human').innerText = data.human_recovered;
-            document.getElementById('control_rec').innerText = data.control_recovered;
-            document.getElementById('control_fail').innerText = data.control_still_failed;
-            document.getElementById('at_risk').innerText = data.at_risk;
-            document.getElementById('escalated').innerText = data.escalated;
+            document.getElementById('agent_count').innerText = data.agent_recovered_count;
+            document.getElementById('agent_paise').innerText = data.agent_recovered_paise;
+            document.getElementById('human_count').innerText = data.human_recovered_count;
+            document.getElementById('human_paise').innerText = data.human_recovered_paise;
+            document.getElementById('control_rec_count').innerText = data.control_recovered_count;
+            document.getElementById('control_rec_paise').innerText = data.control_recovered_paise;
+            document.getElementById('control_fail_count').innerText = data.control_still_failed_count;
+            document.getElementById('at_risk').innerText = data.at_risk_count;
+            document.getElementById('escalated').innerText = data.escalated_count;
             document.getElementById('compliance').innerText = data.compliance_score;
           }
           setInterval(refresh, 1000);
@@ -472,10 +630,13 @@ def dashboard_page() -> str:
       <body>
         <h1>Recovery Agent Dashboard</h1>
         <ul>
-          <li>Agent Recovered: <span id="agent">0</span></li>
-          <li>Human Recovered: <span id="human">0</span></li>
-          <li>Control Recovered (natural): <span id="control_rec">0</span></li>
-          <li>Control Still Failed: <span id="control_fail">0</span></li>
+          <li>Agent Recovered (count): <span id="agent_count">0</span></li>
+          <li>Agent Recovered (paise): <span id="agent_paise">0</span></li>
+          <li>Human Recovered (count): <span id="human_count">0</span></li>
+          <li>Human Recovered (paise): <span id="human_paise">0</span></li>
+          <li>Control Recovered Natural (count): <span id="control_rec_count">0</span></li>
+          <li>Control Recovered Natural (paise): <span id="control_rec_paise">0</span></li>
+          <li>Control Still Failed: <span id="control_fail_count">0</span></li>
           <li>At Risk: <span id="at_risk">0</span></li>
           <li>Escalated: <span id="escalated">0</span></li>
           <li>Compliance Score: <span id="compliance">100</span>%</li>
@@ -485,10 +646,16 @@ def dashboard_page() -> str:
     """
 
 
+# ---------------------------------------------------------------------------
+# Chaos / cluster
+# ---------------------------------------------------------------------------
 @app.post("/admin/chaos/kill-leader")
 def chaos_kill_leader() -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Chaos endpoints are demo-only")
+    if USE_ETCD:
+        subprocess.run(["docker", "compose", "stop", "etcd3"], check=False)
+        return {"status": "killed", "message": "Stopped etcd3; new leader should be elected."}
     return {"status": "simulated", "message": "Leader kill simulated; new leader would be elected."}
 
 
@@ -501,11 +668,20 @@ def chaos_spike() -> dict:
 
 @app.get("/cluster/status")
 def cluster_status() -> dict:
+    if USE_ETCD:
+        members = etcd_client.members
+        return {
+            "nodes": [
+                {"id": str(m.id), "name": m.name, "peer_urls": list(m.peer_urls)}
+                for m in members
+            ],
+            "using_real_etcd": True,
+        }
     return {
         "nodes": [
             {"id": "etcd1", "state": "leader", "healthy": True},
             {"id": "etcd2", "state": "follower", "healthy": True},
             {"id": "etcd3", "state": "follower", "healthy": True},
         ],
-        "leader": "etcd1",
+        "using_real_etcd": False,
     }
