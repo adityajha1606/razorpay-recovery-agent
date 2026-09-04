@@ -280,6 +280,8 @@ class StateMachine:
             case.case_id, "NOTICE_SENT", "RETRY_SCHEDULED",
             "schedule_retry", RULE_VERSION, now, "agent",
         ))
+        # Attach scheduled_at for independent verification
+        audit[-1].scheduled_at = decision.scheduled_at
 
         return case, audit, decision
 
@@ -312,23 +314,13 @@ class StateMachine:
         config: AppConfig,
         clock: Clock,
     ) -> tuple[RecoveryCase, list[AuditEntry], bool]:
-        """Attempt to commit and then execute a retry decision.
-
-        This is the only path to `RETRY_EXECUTED`. It first asks the
-        commit backend to durably approve the action; if the commit fails
-        (e.g., duplicate), the case remains in `RETRY_SCHEDULED` and no
-        transition occurs. The boolean return indicates whether execution
-        actually happened.
-        """
         if case.state != "RETRY_SCHEDULED":
             raise ValueError(f"Cannot attempt execution from state {case.state}")
 
-        # Commit first — this is the quorum/outbox gate (Invariant 3).
         committed = commit_backend.commit(decision)
         if not committed:
             return case, [], False
 
-        # Commit approved: transition to RETRY_EXECUTED.
         now = clock.now()
         audit: list[AuditEntry] = []
         case.state = "RETRY_EXECUTED"

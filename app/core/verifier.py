@@ -11,7 +11,7 @@ Rules checked (from builder doc §8 and config/npci_rules.yaml):
   - max retries not exceeded
   - notice lead time respected (measured from NOTICE_SENT to RETRY_EXECUTED)
   - retry spacing respected (using executed_at)
-  - peak-hour blackout respected
+  - peak-hour blackout respected (both actual execution and scheduled time)
   - AFA ceiling respected
   - bucket immutability
   - throttle budget neutrality
@@ -64,11 +64,6 @@ def verify_case_compliance(
 
     # 2. Notice lead time: gap between NOTICE_SENT and the RETRY_EXECUTED that
     # follows it must be >= config.npci_rules.notice_lead_time.
-    #
-    # We deliberately do NOT compare NOTICE_SENT -> RETRY_SCHEDULED: those two
-    # entries are logged in the same synchronous call, so their timestamps are
-    # always nearly identical regardless of scheduled_at. The correct rule is
-    # the gap between notice sent and the actual execution.
     last_notice_entry = None
     found_execution_after_notice = False
     for entry in audit_entries:
@@ -88,8 +83,6 @@ def verify_case_compliance(
                 break
             last_notice_entry = None  # matched; next cycle needs its own notice
 
-    # If no NOTICE_SENT -> RETRY_EXECUTED pair was found at all (e.g., no retries),
-    # the notice lead time rule is vacuously satisfied.
     if last_notice_entry is None or not found_execution_after_notice:
         results.append(VerificationResult("notice_lead_time", True))
 
@@ -107,22 +100,30 @@ def verify_case_compliance(
     else:
         results.append(VerificationResult("retry_spacing", True))
 
-    # 4. Peak-hour blackout: any RETRY_EXECUTED or RETRY_SCHEDULED inside peak windows?
+    # 4. Peak-hour blackout: check both actual execution timestamps and
+    # scheduled_at on RETRY_SCHEDULED entries.
+    peak_violation = False
     for entry in audit_entries:
         if entry.to_state in ("RETRY_EXECUTED", "RETRY_SCHEDULED"):
-            local_time = entry.timestamp.astimezone(IST).time()
-            for window in config.npci_rules.peak_windows:
-                if window.start <= local_time < window.end:
-                    results.append(VerificationResult(
-                        "peak_hour_blackout",
-                        False,
-                        f"timestamp {entry.timestamp.isoformat()} inside peak window {window.start}-{window.end}",
-                    ))
+            timestamps_to_check = [entry.timestamp]
+            if entry.to_state == "RETRY_SCHEDULED" and entry.scheduled_at is not None:
+                timestamps_to_check.append(entry.scheduled_at)
+            for ts in timestamps_to_check:
+                local_time = ts.astimezone(IST).time()
+                for window in config.npci_rules.peak_windows:
+                    if window.start <= local_time < window.end:
+                        results.append(VerificationResult(
+                            "peak_hour_blackout",
+                            False,
+                            f"timestamp {ts.isoformat()} inside peak window {window.start}-{window.end}",
+                        ))
+                        peak_violation = True
+                        break
+                if peak_violation:
                     break
-            else:
-                continue
+        if peak_violation:
             break
-    else:
+    if not peak_violation:
         results.append(VerificationResult("peak_hour_blackout", True))
 
     # 5. AFA ceiling: treatment case with amount > ceiling should not have retries

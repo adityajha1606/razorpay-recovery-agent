@@ -8,12 +8,14 @@ thread‑safe: FastAPI runs async but our state machine is single‑threaded,
 and the builder doc §4 says "Deterministic Python, single‑threaded apply
 loop". All methods are synchronous — no `await`, no I/O, no hidden state.
 
-A Postgres‑backed replacement will implement the same Protocol later, so
-nothing else in app/ needs to change.
+The audit trail is Merkle‑chained: each entry's hash includes the previous
+entry's hash, making the log tamper‑evident.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -172,7 +174,6 @@ class InMemoryCaseStore:
             ) from exc
 
     def update_retry_decision(self, decision: RetryDecision) -> None:
-        """Update an existing RetryDecision. Raises if missing."""
         key = (decision.case_id, decision.attempt_number)
         if key not in self._decisions:
             raise CaseNotFoundError(
@@ -184,12 +185,45 @@ class InMemoryCaseStore:
         return [d for d in self._decisions.values() if d.outcome == "pending"]
 
     # ------------------------------------------------------------------
-    # Audit trail
+    # Audit trail with Merkle chain
     # ------------------------------------------------------------------
+    @staticmethod
+    def _serialize_entry(entry: AuditEntry) -> str:
+        """Return a deterministic JSON string for hashing an AuditEntry."""
+        return json.dumps({
+            "case_id": entry.case_id,
+            "from_state": entry.from_state,
+            "to_state": entry.to_state,
+            "rule_fired": entry.rule_fired,
+            "rule_version": entry.rule_version,
+            "timestamp": entry.timestamp.isoformat(),
+            "actor": entry.actor,
+            "sequence_id": entry.sequence_id,
+            "prev_hash": entry.prev_hash,
+            "scheduled_at": entry.scheduled_at.isoformat() if entry.scheduled_at else None,
+        }, sort_keys=True)
+
+    @staticmethod
+    def _hash_entry(entry: AuditEntry) -> str:
+        """Compute SHA-256 hash of the serialized entry."""
+        serialized = InMemoryCaseStore._serialize_entry(entry)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
     def append_audit(self, entry: AuditEntry) -> None:
+        """Append an AuditEntry to the case's audit trail. Assigns
+        sequence_id if None, links the previous hash, and stores the entry
+        hash so the chain can be verified independently."""
         if entry.sequence_id is None:
             entry.sequence_id = self._next_sequence
             self._next_sequence += 1
+
+        if self._audit_logs.get(entry.case_id):
+            last_entry = self._audit_logs[entry.case_id][-1]
+            entry.prev_hash = last_entry.entry_hash
+        else:
+            entry.prev_hash = None
+
+        entry.entry_hash = self._hash_entry(entry)
         self._audit_logs[entry.case_id].append(entry)
 
     def get_audit_trail(self, case_id: str) -> list[AuditEntry]:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal  # not used after paise change, but kept for import? no
 
 import pytest
 
@@ -115,6 +114,14 @@ class TestCaseStore:
         with pytest.raises(FailureAlreadyRecordedError):
             store.record_failure(event)
 
+    def test_redelivery_guard_by_payment_id(self) -> None:
+        store = InMemoryCaseStore()
+        event = make_failure(case_id="pay_redelivery", attempt=2, payment_id="pay_same_payment_id")
+        store.record_failure(event)
+        duplicate = make_failure(case_id="pay_redelivery", attempt=3, payment_id="pay_same_payment_id")
+        with pytest.raises(FailureAlreadyRecordedError):
+            store.record_failure(duplicate)
+
     def test_record_decision_and_get(self) -> None:
         store = InMemoryCaseStore()
         decision = make_decision()
@@ -143,6 +150,36 @@ class TestCaseStore:
         trail = store.get_audit_trail("pay_audit")
         assert len(trail) == 1
         assert trail[0].sequence_id == 1
+
+    def test_audit_chain_hashes_link(self) -> None:
+        store = InMemoryCaseStore()
+        entry1 = AuditEntry(
+            case_id="pay_chain",
+            from_state="RECEIVED",
+            to_state="CLASSIFIED",
+            rule_fired="create_case",
+            rule_version=1,
+            timestamp=NOW,
+            actor="agent",
+        )
+        store.append_audit(entry1)
+        entry2 = AuditEntry(
+            case_id="pay_chain",
+            from_state="CLASSIFIED",
+            to_state="TREATMENT",
+            rule_fired="assign_bucket_treatment",
+            rule_version=1,
+            timestamp=NOW,
+            actor="agent",
+        )
+        store.append_audit(entry2)
+
+        trail = store.get_audit_trail("pay_chain")
+        assert len(trail) == 2
+        assert trail[0].prev_hash is None
+        assert trail[0].entry_hash is not None
+        assert trail[1].prev_hash == trail[0].entry_hash
+        assert trail[1].entry_hash is not None
 
     def test_get_pending_retries(self) -> None:
         store = InMemoryCaseStore()

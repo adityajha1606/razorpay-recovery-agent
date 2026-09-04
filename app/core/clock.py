@@ -33,6 +33,8 @@ class RealClock(Clock):
         return datetime.now(timezone.utc)
 
     def resolve_delay(self, real_delay: timedelta) -> timedelta:
+        if real_delay < timedelta(0):
+            raise ValueError("real_delay must not be negative")
         return real_delay
 
     def advance(self, delta: timedelta) -> datetime:
@@ -41,6 +43,8 @@ class RealClock(Clock):
 
 class AcceleratedClock(Clock):
     def __init__(self, time_scale: int):
+        if time_scale < 1:
+            raise ValueError("time_scale must be >= 1")
         self.time_scale = time_scale
         self._offset = timedelta(0)
 
@@ -48,6 +52,8 @@ class AcceleratedClock(Clock):
         return datetime.now(timezone.utc) + self._offset
 
     def resolve_delay(self, real_delay: timedelta) -> timedelta:
+        if real_delay < timedelta(0):
+            raise ValueError("real_delay must not be negative")
         return real_delay / self.time_scale
 
     def advance(self, delta: timedelta) -> datetime:

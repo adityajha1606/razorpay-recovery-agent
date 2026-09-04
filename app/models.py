@@ -179,7 +179,12 @@ class AuditEntry:
     rule-citation receipt (§9F) actually renders — every state transition
     must produce one of these naming the exact rule that caused it.
 
-    `sequence_id` is optional; the store assigns it if None.
+    `prev_hash` and `entry_hash` are set by the store to form a
+    tamper-evident chain. `prev_hash` is the hash of the previous entry;
+    `entry_hash` is the hash of this entry including its `prev_hash`.
+
+    `scheduled_at` is set only for `RETRY_SCHEDULED` entries and stores the
+    exact retry schedule time for independent verification.
     """
 
     case_id: str
@@ -190,6 +195,9 @@ class AuditEntry:
     timestamp: datetime
     actor: Actor
     sequence_id: Optional[int] = None  # assigned by store if None
+    prev_hash: Optional[str] = None
+    entry_hash: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
         if not self.rule_fired:

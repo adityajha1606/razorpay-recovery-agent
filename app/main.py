@@ -7,10 +7,15 @@ decline classification, state machine integration, and demo support endpoints.
 If USE_ETCD=true, the commit backend uses a real 3-node etcd cluster for
 quorum-approved execution. Otherwise, it falls back to an in-memory
 idempotent backend with the same contract.
+
+A background task periodically releases THROTTLED cases so the demo is
+self-healing without manual admin calls.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -28,6 +33,7 @@ from app.core.clock import AcceleratedClock, Clock, RealClock
 from app.core.commit_backend import EtcdQuorumBackend
 from app.core.config import AppConfig, ProfileName, load_config
 from app.core.decline_router import classify_failure
+from app.core.dnd import is_dnd_hour
 from app.core.state_machine import StateMachine
 from app.core.verifier import verify_case_compliance
 from app.core.webhook_parser import parse_payment_failed, parse_payment_captured
@@ -94,6 +100,29 @@ logger.info(
 )
 
 
+async def _periodic_throttle_release():
+    """Release THROTTLED cases automatically in the background (demo tick)."""
+    while True:
+        await asyncio.sleep(60)  # check every 60 seconds real time
+        try:
+            for case in store.list_cases():
+                if case.state == "THROTTLED":
+                    updated, audit_entries, _ = state_machine.release_throttle(
+                        case, config, clock
+                    )
+                    store.update_case(updated)
+                    for entry in audit_entries:
+                        store.append_audit(entry)
+                    logger.info("Auto-released throttled case %s", case.case_id)
+        except Exception as exc:  # noqa: BLE001 — keep the loop alive
+            logger.warning("Periodic throttle release failed: %s", exc)
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_periodic_throttle_release())
+
+
 def _not_implemented(section: str) -> HTTPException:
     return HTTPException(
         status_code=501,
@@ -130,7 +159,6 @@ async def webhook_payment_failed(request: Request) -> dict:
     if not payment_id:
         raise HTTPException(status_code=400, detail="Missing payment_id")
 
-    # Redelivery check
     existing_attempt = store.find_attempt_by_payment_id(payment_id)
     if existing_attempt:
         case_id, attempt = existing_attempt
@@ -304,6 +332,13 @@ async def simulate_failure(req: SimulateFailureRequest) -> dict:
 def send_notice(case_id: str) -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
+
+    # DND check: defer notice if currently within DND hours
+    if is_dnd_hour(clock.now()):
+        raise HTTPException(
+            status_code=409,
+            detail="DND hours active (21:00-09:00 IST). Notice deferred; advance clock to after 09:00 IST.",
+        )
 
     case = store.get_case(case_id)
     if case.state != "NOTICE_PENDING":
@@ -483,25 +518,26 @@ class ComplianceCheckRequest(BaseModel):
 
 @app.post("/compliance/check")
 def compliance_check(req: ComplianceCheckRequest) -> dict:
-    """Public oracle: answers whether a retry is allowed right now for a
-    given failure context. Returns authoritative yes/no + rule citation,
-    plus an advisory probability estimate (rule-based for now, ML later)."""
-
-    # Authoritative classification
     decline_class, retryable = classify_failure(config, req.reason_code, req.error_reason)
-
-    # Simple advisory probability: technical -> 0.8, business -> 0.1, default -> 0.3
     advisory_prob = 0.8 if decline_class == "technical" else 0.1
-
-    # Next eligible time if retryable: now + notice_lead_time (unscaled for clarity)
     now = clock.now()
     next_eligible = now + config.npci_rules.notice_lead_time if retryable else None
+
+    # Build a reasoning string with concrete config values
+    reasoning_parts = [
+        f"notice_lead_time={config.npci_rules.notice_lead_time}",
+        f"spacing={[str(s) for s in config.npci_rules.spacing]}",
+        f"peak_windows={[f'{w.start}-{w.end}' for w in config.npci_rules.peak_windows]}",
+        f"afa_ceiling={config.npci_rules.afa_free_ceiling} paise",
+    ]
+    reasoning = "; ".join(reasoning_parts)
 
     return {
         "allowed": retryable,
         "decline_class": decline_class,
         "advisory_technical_probability": advisory_prob,
         "rule_citation": "NPCI pre-debit notice lead time, spacing, peak-hour blackout, AFA ceiling (config/npci_rules.yaml)",
+        "reasoning": reasoning,
         "next_eligible_at": next_eligible.isoformat() if next_eligible else None,
     }
 
@@ -511,7 +547,6 @@ def compliance_check(req: ComplianceCheckRequest) -> dict:
 # ---------------------------------------------------------------------------
 @app.get("/cases")
 def list_cases() -> dict:
-    """List all cases with basic info."""
     cases = store.list_cases()
     return {
         "cases": [
@@ -533,7 +568,6 @@ def list_cases() -> dict:
 # ---------------------------------------------------------------------------
 @app.get("/cases/{case_id}/receipt")
 def case_receipt(case_id: str) -> dict:
-    """Rule-citation trace over the case's AuditEntry history (§9F)."""
     case = store.get_case(case_id)
     audit_trail = store.get_audit_trail(case_id)
     return {
@@ -550,6 +584,9 @@ def case_receipt(case_id: str) -> dict:
                 "rule_version": entry.rule_version,
                 "timestamp": entry.timestamp.isoformat(),
                 "actor": entry.actor,
+                "scheduled_at": entry.scheduled_at.isoformat() if entry.scheduled_at else None,
+                "entry_hash": entry.entry_hash,
+                "prev_hash": entry.prev_hash,
             }
             for entry in audit_trail
         ],
@@ -558,7 +595,6 @@ def case_receipt(case_id: str) -> dict:
 
 @app.get("/cases/{case_id}/verify")
 def verify_case(case_id: str) -> dict:
-    """Run the independent compliance verifier on a case's audit trail."""
     case = store.get_case(case_id)
     audit = store.get_audit_trail(case_id)
     results = verify_case_compliance(case, audit, config)
@@ -570,6 +606,47 @@ def verify_case(case_id: str) -> dict:
         ],
         "all_passed": all(r.passed for r in results),
     }
+
+
+@app.get("/cases/{case_id}/verify_chain")
+def verify_chain(case_id: str) -> dict:
+    """Independently verify the Merkle chain of audit entries for a case."""
+    audit = store.get_audit_trail(case_id)
+    if not audit:
+        return {"case_id": case_id, "valid": False, "detail": "No audit entries"}
+
+    prev_hash = None
+    for entry in audit:
+        # Recompute expected previous hash
+        if entry.prev_hash != prev_hash:
+            return {
+                "case_id": case_id,
+                "valid": False,
+                "detail": f"Chain break at sequence {entry.sequence_id}: expected prev {prev_hash}, got {entry.prev_hash}",
+            }
+        # Recompute entry hash
+        serialized = json.dumps({
+            "case_id": entry.case_id,
+            "from_state": entry.from_state,
+            "to_state": entry.to_state,
+            "rule_fired": entry.rule_fired,
+            "rule_version": entry.rule_version,
+            "timestamp": entry.timestamp.isoformat(),
+            "actor": entry.actor,
+            "sequence_id": entry.sequence_id,
+            "prev_hash": entry.prev_hash,
+            "scheduled_at": entry.scheduled_at.isoformat() if entry.scheduled_at else None,
+        }, sort_keys=True)
+        expected_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        if entry.entry_hash != expected_hash:
+            return {
+                "case_id": case_id,
+                "valid": False,
+                "detail": f"Hash mismatch at sequence {entry.sequence_id}",
+            }
+        prev_hash = entry.entry_hash
+
+    return {"case_id": case_id, "valid": True, "detail": "Chain intact"}
 
 
 # ---------------------------------------------------------------------------
@@ -654,8 +731,40 @@ def chaos_kill_leader() -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Chaos endpoints are demo-only")
     if USE_ETCD:
-        subprocess.run(["docker", "compose", "stop", "etcd3"], check=False)
-        return {"status": "killed", "message": "Stopped etcd3; new leader should be elected."}
+        try:
+            # Map member ID to name using etcd3 Python client
+            member_id_to_name = {str(m.id): m.name for m in etcd_client.members}
+
+            # Get leader ID from etcdctl endpoint status
+            result = subprocess.run(
+                [
+                    "docker", "compose", "exec", "-T", "etcd1",
+                    "etcdctl", "endpoint", "status", "--write-out=json", "--cluster",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            statuses = json.loads(result.stdout)
+            leader_id = None
+            for status in statuses:
+                leader_id = status.get("Status", {}).get("leader")
+                if leader_id:
+                    break
+
+            if leader_id is None:
+                raise ValueError("Leader ID not found in etcdctl output")
+
+            leader_name = member_id_to_name.get(str(leader_id))
+            if leader_name is None:
+                raise ValueError(f"Leader ID {leader_id} not found in members")
+
+            subprocess.run(["docker", "compose", "stop", leader_name], check=False)
+            return {"status": "killed", "message": f"Stopped {leader_name}; new leader should be elected."}
+        except Exception as exc:
+            logger.warning("Leader detection failed, stopping etcd3 as fallback: %s", exc)
+            subprocess.run(["docker", "compose", "stop", "etcd3"], check=False)
+            return {"status": "killed", "message": "Stopped etcd3; new leader should be elected."}
     return {"status": "simulated", "message": "Leader kill simulated; new leader would be elected."}
 
 
