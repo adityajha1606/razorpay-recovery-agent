@@ -601,7 +601,7 @@ If you're extending anything that touches compliance rules, please keep the `npc
 
 ## License
 
-No `LICENSE` file is committed yet. Until one is added, treat this as all-rights-reserved for hackathon judging purposes. MIT is the intended license post-hackathon — update this section (and the badge at the top) once `LICENSE` is actually committed.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
 ---
 
