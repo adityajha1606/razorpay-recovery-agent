@@ -145,6 +145,7 @@ The system is designed to be **deterministic** and **explainable**. Every action
   <img src="docs/screenshots/dashboard.png" width="45%" alt="Dashboard" />
   <img src="docs/screenshots/cluster.png" width="45%" alt="Cluster Status" />
 </div>
+
 ---
 
 ## Honest Limitations
