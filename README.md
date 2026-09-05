@@ -16,7 +16,7 @@ It recovers failed UPI Autopay mandates — and the hard part isn't retrying, it
 ![hypothesis](https://img.shields.io/badge/property%20tests-Hypothesis-6C5CE7)
 ![docker](https://img.shields.io/badge/docker--compose-demo%20cluster-2496ED?logo=docker&logoColor=white)
 ![status](https://img.shields.io/badge/status-hackathon%20submission-orange)
-![license](https://img.shields.io/badge/license-MIT%20(planned)-blue)
+![license](https://img.shields.io/badge/license-MIT%20-blue)
 
 </div>
 
