@@ -1,0 +1,4 @@
+[importlinter:contract:explainer-is-readonly]
+type = forbidden
+source_modules = app.explain
+forbidden_modules = app.core.state_machine, app.core.commit_backend

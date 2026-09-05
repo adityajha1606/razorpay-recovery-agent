@@ -12,7 +12,7 @@ Rules checked (from builder doc §8 and config/npci_rules.yaml):
   - notice lead time respected (measured from NOTICE_SENT to RETRY_EXECUTED)
   - retry spacing respected (using executed_at)
   - peak-hour blackout respected (both actual execution and scheduled time)
-  - AFA ceiling respected
+  - AFA ceiling respected (default category)
   - bucket immutability
   - throttle budget neutrality
 """
@@ -89,7 +89,9 @@ def verify_case_compliance(
     # 3. Retry spacing by executed_at: consecutive RETRY_EXECUTED entries
     executed_times = [e.timestamp for e in audit_entries if e.to_state == "RETRY_EXECUTED"]
     for i in range(1, len(executed_times)):
-        required = config.npci_rules.spacing[min(i-1, len(config.npci_rules.spacing)-1)]
+        required = config.self_imposed.retry_spacing[
+            min(i, len(config.self_imposed.retry_spacing) - 1)
+        ]
         if executed_times[i] - executed_times[i-1] < required:
             results.append(VerificationResult(
                 "retry_spacing",
@@ -126,14 +128,15 @@ def verify_case_compliance(
     if not peak_violation:
         results.append(VerificationResult("peak_hour_blackout", True))
 
-    # 5. AFA ceiling: treatment case with amount > ceiling should not have retries
-    if case.bucket == "treatment" and case.original_amount > config.npci_rules.afa_free_ceiling:
+    # 5. AFA ceiling: treatment case with amount > default ceiling should not have retries
+    default_ceiling = config.npci_rules.afa_free_ceiling.get("default", 1500000)
+    if case.bucket == "treatment" and case.original_amount > default_ceiling:
         retry_states = {"RETRY_SCHEDULED", "RETRY_EXECUTED"}
         if any(e.to_state in retry_states for e in audit_entries):
             results.append(VerificationResult(
                 "afa_ceiling",
                 False,
-                f"amount {case.original_amount} > ceiling {config.npci_rules.afa_free_ceiling} but retry was attempted",
+                f"amount {case.original_amount} > ceiling {default_ceiling} but retry was attempted",
             ))
         else:
             results.append(VerificationResult("afa_ceiling", True))

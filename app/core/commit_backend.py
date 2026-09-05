@@ -16,6 +16,7 @@ import change.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Protocol, runtime_checkable
 
@@ -37,6 +38,15 @@ class CommitBackend(Protocol):
         """
         ...
 
+    def commit_effect(self, case_id: str, attempt: int, effect: dict) -> bool:
+        """Commit a full effect object for exactly-once application.
+
+        Like `commit`, but stores the entire effect payload instead of just
+        a boolean. This allows the case store to be rebuilt/idempotently
+        healed from the commit log after a crash.
+        """
+        ...
+
 
 class EtcdQuorumBackend:
     """Quorum-committed backend (§3). Requires a running etcd cluster
@@ -53,10 +63,6 @@ class EtcdQuorumBackend:
 
     def commit(self, action: RetryDecision) -> bool:
         key = self._key_for(action)
-        # "Commit only if not already committed": the transaction's success
-        # branch (the put) only runs when the key's version is still 0, so a
-        # concurrent second attempt at the same (case_id, attempt_number)
-        # loses the race instead of double-committing.
         success, _responses = self._client.transaction(
             compare=[self._client.transactions.version(key) == 0],
             success=[self._client.transactions.put(key, action.commit_ref)],
@@ -68,6 +74,23 @@ class EtcdQuorumBackend:
                 "— refusing to execute twice (Invariant 4)",
                 action.case_id,
                 action.attempt_number,
+            )
+        return bool(success)
+
+    def commit_effect(self, case_id: str, attempt: int, effect: dict) -> bool:
+        key = f"/recovery/commits/{case_id}/{attempt}"
+        value = json.dumps(effect)
+        success, _responses = self._client.transaction(
+            compare=[self._client.transactions.version(key) == 0],
+            success=[self._client.transactions.put(key, value)],
+            failure=[],
+        )
+        if not success:
+            logger.warning(
+                "etcd commit already exists for case_id=%s attempt_number=%s "
+                "— refusing to execute twice (Invariant 4)",
+                case_id,
+                attempt,
             )
         return bool(success)
 
@@ -101,7 +124,7 @@ class PostgresOutboxBackend:
                 )
             self._conn.commit()
             return True
-        except Exception as exc:  # noqa: BLE001 — narrowed below by SQLSTATE, not swallowed
+        except Exception as exc:
             self._conn.rollback()
             if _is_unique_violation(exc):
                 logger.warning(
@@ -120,9 +143,20 @@ class PostgresOutboxBackend:
             )
             raise
 
+    def commit_effect(self, case_id: str, attempt: int, effect: dict) -> bool:
+        # For Postgres, we can store the effect in a column; for simplicity,
+        # we reuse commit but encode the effect as commit_ref.
+        action = RetryDecision(
+            case_id=case_id,
+            attempt_number=attempt,
+            scheduled_at=datetime.now(timezone.utc),
+            reasoning="",
+            commit_backend="postgres_outbox",
+            commit_ref=json.dumps(effect),
+        )
+        return self.commit(action)
 
-# DDL for the table PostgresOutboxBackend relies on. Run this once against
-# the `postgres` service before Phase 1's Postgres-backed gate.
+
 OUTBOX_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS commit_outbox (
     case_id         TEXT NOT NULL,
@@ -135,12 +169,5 @@ CREATE TABLE IF NOT EXISTS commit_outbox (
 
 
 def _is_unique_violation(exc: Exception) -> bool:
-    """True if `exc` is a Postgres unique-violation (SQLSTATE 23505).
-
-    Checked via the `.diag.sqlstate` attribute psycopg exceptions expose,
-    rather than importing the driver's exception class directly, so this
-    module doesn't hard-fail to import in an environment that only needs
-    `EtcdQuorumBackend`.
-    """
     sqlstate = getattr(getattr(exc, "diag", None), "sqlstate", None)
     return sqlstate == "23505"

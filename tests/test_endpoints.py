@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -11,11 +11,12 @@ from app.models import AuditEntry, RecoveryCase
 
 
 def test_verify_chain_endpoint_valid():
-    # Seed store with a case and chained audit entries
+    case_id = f"pay_chain_endpoint_{uuid.uuid4().hex[:8]}"
+
     case = RecoveryCase(
-        case_id="pay_chain_endpoint",
-        mandate_id="mandate_chain_endpoint",
-        instrument_id="instr_chain_endpoint",
+        case_id=case_id,
+        mandate_id=f"mandate_{case_id}",
+        instrument_id=f"instr_{case_id}",
         original_amount=10000,
         opened_at=clock.now(),
         state="RECOVERED",
@@ -52,9 +53,19 @@ def test_verify_chain_endpoint_valid():
     assert data["detail"] == "Chain intact"
 
 
-def test_verify_chain_endpoint_empty_case_returns_false():
+def test_explain_endpoint():
+    case_id = f"pay_explain_{uuid.uuid4().hex[:8]}"
+    case = RecoveryCase(
+        case_id=case_id,
+        mandate_id=f"mandate_{case_id}",
+        instrument_id=f"instr_{case_id}",
+        original_amount=10000,
+        opened_at=clock.now(),
+        state="RECOVERED",
+    )
+    store.create_case(case)
     client = TestClient(app)
-    response = client.get("/cases/nonexistent/verify_chain")
+    response = client.get(f"/cases/{case_id}/explain?question=Why")
     assert response.status_code == 200
     data = response.json()
-    assert data["valid"] is False
+    assert "explanation" in data

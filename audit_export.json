@@ -1,0 +1,44 @@
+{
+  "case_id": "pay_demo_go2",
+  "state": "CONTROL_RECOVERED",
+  "bucket": "control",
+  "original_amount_paise": 50000,
+  "audit": [
+    {
+      "sequence_id": 1,
+      "from_state": "RECEIVED",
+      "to_state": "CLASSIFIED",
+      "rule_fired": "create_case",
+      "rule_version": 2,
+      "timestamp": "2026-09-05T00:22:47.442671+00:00",
+      "actor": "agent",
+      "scheduled_at": null,
+      "entry_hash": "316986291ae82178b2eceabe98e2fbe5e4175070fee15874b2ed2686098c442c",
+      "prev_hash": null
+    },
+    {
+      "sequence_id": 2,
+      "from_state": "CLASSIFIED",
+      "to_state": "CONTROL_HELD",
+      "rule_fired": "assign_bucket_control",
+      "rule_version": 2,
+      "timestamp": "2026-09-05T00:22:47.442671+00:00",
+      "actor": "agent",
+      "scheduled_at": null,
+      "entry_hash": "43c7beac61d51816896dab29c79c20f5acfbc57c0511d049a73cffa77d080fca",
+      "prev_hash": "316986291ae82178b2eceabe98e2fbe5e4175070fee15874b2ed2686098c442c"
+    },
+    {
+      "sequence_id": 3,
+      "from_state": "CONTROL_HELD",
+      "to_state": "CONTROL_RECOVERED",
+      "rule_fired": "natural_recovery",
+      "rule_version": 2,
+      "timestamp": "2026-09-06T00:22:47.501890+00:00",
+      "actor": "agent",
+      "scheduled_at": null,
+      "entry_hash": "6e29c0021553b89693ae35a6f15bf6a334ff743b502b0e5359969e9b3b7becb0",
+      "prev_hash": "43c7beac61d51816896dab29c79c20f5acfbc57c0511d049a73cffa77d080fca"
+    }
+  ]
+}

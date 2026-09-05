@@ -31,11 +31,9 @@ class TestParsing:
 
 class TestLoadConfig:
     def test_prod_profile_matches_builder_doc_10_3(self, prod_config) -> None:
-        # These exact values come straight from docs/BUILDER_DOC.md §10.3 —
-        # if this test ever needs to change, the builder doc changed first.
         assert prod_config.npci_rules.max_retries == 3
         assert prod_config.npci_rules.notice_lead_time == timedelta(hours=24)
-        assert prod_config.npci_rules.spacing == (
+        assert prod_config.self_imposed.retry_spacing == (
             timedelta(hours=0),
             timedelta(hours=72),
             timedelta(hours=168),

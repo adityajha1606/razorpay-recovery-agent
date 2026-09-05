@@ -13,6 +13,9 @@ Important:
   never change it (Invariant 8).
 - Bucket assignment is deterministic and immutable (Invariant 7).
 - All transitions generate AuditEntry records with rule citations.
+- AFA ceiling is category-specific, read from event notes if present.
+- Success events may arrive late (after escalation or AFA). They are
+  accepted only if the amount matches; otherwise flagged for review.
 """
 
 from __future__ import annotations
@@ -73,8 +76,25 @@ class StateMachine:
         config: AppConfig,
         clock: Clock,
     ) -> tuple[RecoveryCase, list[AuditEntry], Optional[RetryDecision]]:
+        """Handle a successful payment event.
+
+        Accepts success from states where a payment could have landed late:
+        RETRY_EXECUTED, NOTICE_PENDING, NOTICE_SENT, RETRY_SCHEDULED,
+        THROTTLED, ESCALATED, AFA_REQUIRED.
+
+        If the event amount does not match the case's original amount, the
+        case is flagged for review and no state transition occurs.
+        """
         now = clock.now()
         audit: list[AuditEntry] = []
+
+        # Amount validation first — never close out a case with wrong amount.
+        if event.amount != case.original_amount:
+            audit.append(self._audit(
+                case.case_id, case.state, case.state,
+                "amount_mismatch_on_success", RULE_VERSION, now, "agent",
+            ))
+            return case, audit, None
 
         if case.bucket == "control":
             if case.state != "CONTROL_HELD":
@@ -91,7 +111,7 @@ class StateMachine:
             ))
             return case, audit, None
 
-        # treatment bucket
+        # Treatment bucket
         if case.state == "RETRY_EXECUTED":
             case.state = "RECOVERED"
             audit.append(self._audit(
@@ -100,6 +120,7 @@ class StateMachine:
             ))
             return case, audit, None
 
+        # Late success from states before the agent actually fired.
         if case.state in ("NOTICE_PENDING", "NOTICE_SENT", "RETRY_SCHEDULED", "THROTTLED"):
             from_state = case.state
             case.state = "RECOVERED_NATURALLY"
@@ -109,6 +130,17 @@ class StateMachine:
             ))
             return case, audit, None
 
+        # Late success after we already gave up — still real money, close correctly.
+        if case.state in ("ESCALATED", "AFA_REQUIRED"):
+            from_state = case.state
+            case.state = "RECOVERED"
+            audit.append(self._audit(
+                case.case_id, from_state, "RECOVERED",
+                "late_success_reconciled", RULE_VERSION, now, "agent",
+            ))
+            return case, audit, None
+
+        # Already terminal or unknown state: log and ignore.
         audit.append(self._audit(
             case.case_id, case.state, case.state,
             "unexpected_success_event", RULE_VERSION, now, "agent",
@@ -129,7 +161,7 @@ class StateMachine:
 
         case = RecoveryCase(
             case_id=event.case_id,
-            mandate_id=event.mandate_id or event.case_id,
+            mandate_id=event.mandate_id or event.case_id,  # fallback if missing
             instrument_id=event.instrument_id,
             original_amount=event.amount,
             opened_at=now,
@@ -148,7 +180,7 @@ class StateMachine:
             assign_bucket(case, "control")
             case.state = "CONTROL_HELD"
             case.control_outcome = "unknown"
-            control_window = config.npci_rules.control_observation_window
+            control_window = config.self_imposed.control_observation_window
             case.control_observation_deadline = now + clock.resolve_delay(control_window)
             audit.append(self._audit(
                 case.case_id, "CLASSIFIED", "CONTROL_HELD",
@@ -170,8 +202,12 @@ class StateMachine:
             ))
             return case, audit, None
 
-        # AFA threshold check
-        if case.original_amount > config.npci_rules.afa_free_ceiling:
+        # AFA threshold check with category-specific ceiling
+        category = (event.notes or {}).get("category", "default")
+        ceiling = config.npci_rules.afa_free_ceiling.get(
+            category, config.npci_rules.afa_free_ceiling["default"]
+        )
+        if case.original_amount > ceiling:
             case.state = "AFA_REQUIRED"
             audit.append(self._audit(
                 case.case_id, "TREATMENT", "AFA_REQUIRED",
@@ -249,6 +285,7 @@ class StateMachine:
         clock: Clock,
         reason_code: Optional[str] = None,
         previous_executed_at: Optional[datetime] = None,
+        bandit=None,
     ) -> tuple[RecoveryCase, list[AuditEntry], Optional[RetryDecision]]:
         now = clock.now()
         audit: list[AuditEntry] = []
@@ -263,7 +300,7 @@ class StateMachine:
         ))
 
         scheduled_at, reasoning = self._compute_scheduled_at(
-            case.retries_used, reason_code, config, clock, previous_executed_at,
+            case.retries_used, reason_code, config, clock, previous_executed_at, bandit,
         )
 
         decision = RetryDecision(
@@ -280,7 +317,6 @@ class StateMachine:
             case.case_id, "NOTICE_SENT", "RETRY_SCHEDULED",
             "schedule_retry", RULE_VERSION, now, "agent",
         ))
-        # Attach scheduled_at for independent verification
         audit[-1].scheduled_at = decision.scheduled_at
 
         return case, audit, decision
@@ -379,8 +415,9 @@ class StateMachine:
         config: AppConfig,
         clock: Clock,
         previous_executed_at: Optional[datetime] = None,
+        bandit=None,
     ) -> tuple[datetime, str]:
-        spacing = config.npci_rules.spacing
+        spacing = config.self_imposed.retry_spacing
         idx = min(retries_used, len(spacing) - 1)
         spacing_delay = spacing[idx]
         notice_lead = config.npci_rules.notice_lead_time
@@ -398,8 +435,23 @@ class StateMachine:
             "notice lead" if by_notice >= by_spacing else "NPCI spacing floor"
         )
 
+        latest_at = floor_at + config.self_imposed.max_schedule_window
+        candidates = self._generate_legal_candidates(floor_at, latest_at, config, clock)
+
+        if bandit is not None and candidates:
+            selected = bandit.suggest_from(candidates)
+            assert selected in candidates, "Bandit selected an illegal slot"
+            scheduled_at = selected
+            reasoning = (
+                f"Retry attempt {retries_used + 1}: bandit selected "
+                f"{scheduled_at.isoformat()} among legal slots "
+                f"(floor={floor_at.isoformat()}, latest={latest_at.isoformat()}). "
+                f"Constraint: {constraint_note} (config v{RULE_VERSION})."
+            )
+            return scheduled_at, reasoning
+
+        # Fallback: salary window / floor
         if reason_code == "insufficient_funds":
-            latest_at = floor_at + config.npci_rules.max_schedule_window
             salary_day = self._first_salary_window_day(floor_at, latest_at)
             if salary_day is not None:
                 chosen_delay = salary_day - now
@@ -423,6 +475,25 @@ class StateMachine:
         if scheduled_at != now + clock.resolve_delay(floor_delay):
             reasoning += " Peak-hour blackout applied."
         return scheduled_at, reasoning
+
+    def _generate_legal_candidates(
+        self,
+        floor: datetime,
+        latest: datetime,
+        config: AppConfig,
+        clock: Clock,
+    ) -> list[datetime]:
+        """Return a small set of legal candidate timestamps within [floor, latest]."""
+        candidates = []
+        for hours in (0, 12, 24, 48, 72):
+            candidate = floor + clock.resolve_delay(timedelta(hours=hours))
+            if candidate <= latest:
+                candidate = self._avoid_peak_windows(candidate, config, clock, floor)
+                if candidate <= latest:
+                    candidates.append(candidate)
+        if not candidates:
+            candidates = [self._avoid_peak_windows(floor, config, clock, floor)]
+        return candidates
 
     def _avoid_peak_windows(
         self,

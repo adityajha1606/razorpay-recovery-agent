@@ -8,6 +8,10 @@ raw dicts. This is the one place that file gets read; everything else
 (decline router, retry optimizer, throttles) should take an `AppConfig` as
 a parameter rather than opening the YAML itself, so the rule-citation
 receipt (§9F) always has one canonical source to point back to.
+
+The config now explicitly separates:
+  - NpciRules: sourced from NPCI/RBI circulars (citable)
+  - SelfImposedPolicy: our own conservative, tunable floors
 """
 
 from __future__ import annotations
@@ -44,9 +48,6 @@ def parse_time_scale(value: str) -> int:
 
 
 def parse_clock_time(value: str) -> time:
-    """Parse a 24h 'HH:MM' string (IST wall-clock) into a `time`.
-    Whatever consumes NpciRules.peak_windows must convert Clock.now() to
-    IST before comparing — these are wall-clock times, not UTC."""
     match = _CLOCK_TIME_RE.match(value.strip())
     if not match:
         raise ValueError(f"Unsupported clock time format: {value!r} (expected e.g. '10:00')")
@@ -62,15 +63,30 @@ class PeakWindow:
 
 @dataclass(frozen=True)
 class NpciRules:
-    """The regulatory floor everything else in the system operates inside."""
+    """The regulatory floor from NPCI/RBI circulars (sourced)."""
 
     max_retries: int
     notice_lead_time: timedelta
-    spacing: tuple[timedelta, ...]
-    control_observation_window: timedelta
-    max_schedule_window: timedelta
     peak_windows: tuple[PeakWindow, ...]
-    afa_free_ceiling: int  # integer paise
+    afa_free_ceiling: dict[str, int]  # category -> paise ceiling
+
+
+@dataclass(frozen=True)
+class SelfImposedPolicy:
+    """Our own conservative, tunable floors. NOT sourced from NPCI."""
+
+    control_observation_window: timedelta
+    retry_spacing: tuple[timedelta, ...]   # between attempts
+    max_schedule_window: timedelta         # latest slot for an attempt
+
+    def __post_init__(self) -> None:
+        if any(d < timedelta(0) for d in self.retry_spacing):
+            raise ValueError("retry spacing cannot be negative")
+        # first spacing may be 0h (notice lead already ensures 24h before first retry)
+        # subsequent spacings must be at least 24h
+        for d in self.retry_spacing[1:]:
+            if d < timedelta(hours=24):
+                raise ValueError("self-imposed retry spacing below safe floor of 24h")
 
 
 @dataclass(frozen=True)
@@ -88,9 +104,11 @@ class ProfileConfig:
 @dataclass(frozen=True)
 class AppConfig:
     npci_rules: NpciRules
+    self_imposed: SelfImposedPolicy
     profile_name: ProfileName
     profile: ProfileConfig
     decline_rules: DeclineRules
+    rails: dict[str, float]  # advisory success rates per rail
 
 
 def load_config(profile_name: ProfileName = "prod", path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
@@ -112,14 +130,21 @@ def load_config(profile_name: ProfileName = "prod", path: Path = DEFAULT_CONFIG_
     npci_rules = NpciRules(
         max_retries=int(npci_raw["max_retries"]),
         notice_lead_time=parse_duration(str(npci_raw["notice_lead_time"])),
-        spacing=tuple(parse_duration(str(s)) for s in npci_raw["spacing"]),
-        control_observation_window=parse_duration(str(npci_raw["control_observation_window"])),
-        max_schedule_window=parse_duration(str(npci_raw["max_schedule_window"])),
         peak_windows=tuple(
             PeakWindow(start=parse_clock_time(str(w["start"])), end=parse_clock_time(str(w["end"])))
             for w in npci_raw.get("peak_windows", [])
         ),
-        afa_free_ceiling=int(npci_raw["afa_free_ceiling"]),
+        afa_free_ceiling={
+            k: int(v) for k, v in npci_raw["afa_free_ceiling"].items()
+        },
+    )
+
+    # Self-imposed policy (our own floors)
+    self_raw = raw.get("self_imposed", {})
+    self_imposed = SelfImposedPolicy(
+        control_observation_window=parse_duration(str(self_raw.get("control_observation_window", "72h"))),
+        retry_spacing=tuple(parse_duration(str(s)) for s in self_raw.get("retry_spacing", ["0h", "72h", "168h"])),
+        max_schedule_window=parse_duration(str(self_raw.get("max_schedule_window", "48h"))),
     )
 
     profile_raw = raw["profiles"][profile_name]
@@ -137,9 +162,14 @@ def load_config(profile_name: ProfileName = "prod", path: Path = DEFAULT_CONFIG_
         default=default_class,
     )
 
+    rails_raw = raw.get("rails") or {"upi": 0.65, "card": 0.70, "nach": 0.75}
+    rails = {str(k): float(v) for k, v in rails_raw.items()}
+
     return AppConfig(
         npci_rules=npci_rules,
+        self_imposed=self_imposed,
         profile_name=profile_name,
         profile=profile,
         decline_rules=decline_rules,
+        rails=rails,
     )

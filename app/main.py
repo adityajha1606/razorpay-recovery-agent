@@ -8,8 +8,11 @@ If USE_ETCD=true, the commit backend uses a real 3-node etcd cluster for
 quorum-approved execution. Otherwise, it falls back to an in-memory
 idempotent backend with the same contract.
 
-A background task periodically releases THROTTLED cases so the demo is
-self-healing without manual admin calls.
+If USE_POSTGRES=true, the case store uses Postgres; otherwise it uses an
+in-memory store. A background task periodically releases THROTTLED cases.
+
+The commit backend now stores a full effect object, and the case store is
+reconciled from that log on startup and after failed commits.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import etcd3
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
@@ -39,6 +42,11 @@ from app.core.verifier import verify_case_compliance
 from app.core.webhook_parser import parse_payment_failed, parse_payment_captured
 from app.core.webhook_security import verify_webhook_signature
 from app.models import PaymentSuccessEvent, RetryDecision
+
+# Advisory modules
+from app.core.distress import DistressDetector
+from app.core.bandit import RetrySlotBandit
+from app.core.survival import survival_curve
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,6 +70,17 @@ class InMemoryCommitBackend:
         self._committed.add(key)
         return True
 
+    def commit_effect(self, case_id: str, attempt: int, effect: dict) -> bool:
+        action = RetryDecision(
+            case_id=case_id,
+            attempt_number=attempt,
+            scheduled_at=datetime.now(timezone.utc),
+            reasoning="",
+            commit_backend="in_memory",
+            commit_ref=json.dumps(effect),
+        )
+        return self.commit(action)
+
 
 def _wire_clock(config: AppConfig) -> Clock:
     if config.profile_name == "prod":
@@ -73,7 +92,19 @@ _PROFILE_NAME: ProfileName = "demo" if os.getenv("CONFIG_PROFILE") == "demo" els
 config = load_config(profile_name=_PROFILE_NAME)
 clock = _wire_clock(config)
 
-store = InMemoryCaseStore()
+# ---------------------------------------------------------------------------
+# Store selection
+# ---------------------------------------------------------------------------
+USE_POSTGRES = os.getenv("USE_POSTGRES", "false").lower() == "true"
+
+if USE_POSTGRES:
+    logger.info("Using Postgres case store")
+    from app.core.postgres_case_store import PostgresCaseStore
+    store = PostgresCaseStore()
+else:
+    logger.info("Using in-memory case store (USE_POSTGRES not set)")
+    store = InMemoryCaseStore()
+
 state_machine = StateMachine()
 
 # ---------------------------------------------------------------------------
@@ -91,19 +122,31 @@ else:
 
 WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
 
+# Advisory services
+distress_detector = DistressDetector(window=timedelta(hours=24), threshold=3)
+slot_bandit = RetrySlotBandit(slots=["immediate", "24h", "72h"], epsilon=0.1)
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
 logger.info(
-    "Booting with profile=%s time_scale=%sx webhook_secret_set=%s use_etcd=%s",
+    "Booting with profile=%s time_scale=%sx webhook_secret_set=%s use_etcd=%s use_postgres=%s",
     config.profile_name,
     config.profile.time_scale,
     bool(WEBHOOK_SECRET),
     USE_ETCD,
+    USE_POSTGRES,
 )
 
 
+def require_admin_token(authorization: str = Header(default="")) -> None:
+    if config.profile_name == "prod":
+        if not ADMIN_TOKEN or authorization != f"Bearer {ADMIN_TOKEN}":
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 async def _periodic_throttle_release():
-    """Release THROTTLED cases automatically in the background (demo tick)."""
     while True:
-        await asyncio.sleep(60)  # check every 60 seconds real time
+        await asyncio.sleep(60)
         try:
             for case in store.list_cases():
                 if case.state == "THROTTLED":
@@ -114,17 +157,11 @@ async def _periodic_throttle_release():
                     for entry in audit_entries:
                         store.append_audit(entry)
                     logger.info("Auto-released throttled case %s", case.case_id)
-        except Exception as exc:  # noqa: BLE001 — keep the loop alive
+        except Exception as exc:
             logger.warning("Periodic throttle release failed: %s", exc)
 
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(_periodic_throttle_release())
-
-
 def get_leader_name() -> Optional[str]:
-    """Return the current etcd leader's node name, or None if unavailable."""
     if not USE_ETCD:
         return None
     try:
@@ -134,9 +171,7 @@ def get_leader_name() -> Optional[str]:
                 "docker", "compose", "exec", "-T", "etcd1",
                 "etcdctl", "endpoint", "status", "--write-out=json", "--cluster",
             ],
-            capture_output=True,
-            text=True,
-            check=True,
+            capture_output=True, text=True, check=True,
         )
         statuses = json.loads(result.stdout)
         leader_id = None
@@ -151,6 +186,63 @@ def get_leader_name() -> Optional[str]:
     return None
 
 
+def apply_effect(case, effect: dict) -> None:
+    """Idempotently apply a committed effect to a case."""
+    if case.state == effect.get("to_state"):
+        return
+    case.state = effect["to_state"]
+    store.update_case(case)
+    store.append_audit({
+        "case_id": case.case_id,
+        "from_state": "RETRY_SCHEDULED",
+        "to_state": "RETRY_EXECUTED",
+        "rule_fired": "commit_effect_applied",
+        "rule_version": 1,
+        "timestamp": clock.now(),
+        "actor": "agent",
+    })
+
+
+def reconcile_case(case_id: str) -> None:
+    if not USE_ETCD:
+        return
+    try:
+        for value, metadata in etcd_client.get_prefix(f"/recovery/commits/{case_id}/"):
+            effect = json.loads(value.decode())
+            case = store.get_case(case_id)
+            apply_effect(case, effect)
+    except Exception as exc:
+        logger.warning("Reconcile case %s failed: %s", case_id, exc)
+
+
+def reconcile_all() -> int:
+    if not USE_ETCD:
+        return 0
+    healed = 0
+    try:
+        for value, metadata in etcd_client.get_prefix("/recovery/commits/"):
+            effect = json.loads(value.decode())
+            case_id = effect["case_id"]
+            try:
+                case = store.get_case(case_id)
+            except Exception:
+                continue
+            if case.state != effect["to_state"]:
+                apply_effect(case, effect)
+                healed += 1
+    except Exception as exc:
+        logger.warning("Reconciliation scan failed: %s", exc)
+    return healed
+
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(_periodic_throttle_release())
+    healed = reconcile_all()
+    if healed:
+        logger.info("Reconciled %d cases from commit log", healed)
+
+
 def _not_implemented(section: str) -> HTTPException:
     return HTTPException(
         status_code=501,
@@ -162,8 +254,13 @@ def _not_implemented(section: str) -> HTTPException:
 # Health
 # ---------------------------------------------------------------------------
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "profile": config.profile_name, "use_etcd": USE_ETCD}
+def health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "profile": config.profile_name,
+        "use_etcd": USE_ETCD,
+        "use_postgres": USE_POSTGRES,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +323,9 @@ async def webhook_payment_failed(request: Request) -> dict:
     except CaseStoreError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    if existing_case is None:
+        distress_detector.record_failure(updated_case.instrument_id, clock.now())
+
     return {
         "status": "ok",
         "case_id": updated_case.case_id,
@@ -278,7 +378,7 @@ async def webhook_payment_succeeded(request: Request) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Admin / demo endpoints
+# Admin / demo endpoints (with token gate on prod)
 # ---------------------------------------------------------------------------
 class SimulateFailureRequest(BaseModel):
     payment_id: str
@@ -289,7 +389,7 @@ class SimulateFailureRequest(BaseModel):
     notes: dict | None = None
 
 
-@app.post("/admin/simulate-failure")
+@app.post("/admin/simulate-failure", dependencies=[Depends(require_admin_token)])
 async def simulate_failure(req: SimulateFailureRequest) -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Simulation endpoints are demo-only")
@@ -347,15 +447,17 @@ async def simulate_failure(req: SimulateFailureRequest) -> dict:
     except CaseStoreError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    if existing_case is None:
+        distress_detector.record_failure(updated_case.instrument_id, clock.now())
+
     return {"status": "ok", "case_id": updated_case.case_id, "state": updated_case.state}
 
 
-@app.post("/admin/send-notice/{case_id}")
+@app.post("/admin/send-notice/{case_id}", dependencies=[Depends(require_admin_token)])
 def send_notice(case_id: str) -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
 
-    # DND check: defer notice if currently within DND hours
     if is_dnd_hour(clock.now()):
         raise HTTPException(
             status_code=409,
@@ -368,7 +470,7 @@ def send_notice(case_id: str) -> dict:
 
     try:
         updated_case, audit_entries, decision = state_machine.mark_notice_sent(
-            case, config, clock
+            case, config, clock, bandit=slot_bandit
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -382,7 +484,7 @@ def send_notice(case_id: str) -> dict:
     return {"status": "ok", "case_id": updated_case.case_id, "state": updated_case.state}
 
 
-@app.post("/admin/execute-retry/{case_id}")
+@app.post("/admin/execute-retry/{case_id}", dependencies=[Depends(require_admin_token)])
 def execute_retry(case_id: str) -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
@@ -390,6 +492,21 @@ def execute_retry(case_id: str) -> dict:
     case = store.get_case(case_id)
     if case.state != "RETRY_SCHEDULED":
         raise HTTPException(status_code=409, detail=f"Case is not in RETRY_SCHEDULED, current state={case.state}")
+
+    # Distress gating: if instrument is distressed, block retry and escalate
+    if distress_detector.is_distressed(case.instrument_id, clock.now()):
+        case.state = "ESCALATED"
+        store.update_case(case)
+        store.append_audit({
+            "case_id": case.case_id,
+            "from_state": "RETRY_SCHEDULED",
+            "to_state": "ESCALATED",
+            "rule_fired": "distress_signal",
+            "rule_version": 1,
+            "timestamp": clock.now(),
+            "actor": "agent",
+        })
+        raise HTTPException(status_code=409, detail="Instrument distressed; retry blocked, case escalated")
 
     pending = [d for d in store.get_pending_retries() if d.case_id == case_id]
     if not pending:
@@ -404,25 +521,28 @@ def execute_retry(case_id: str) -> dict:
             detail=f"Retry not yet due: scheduled_at={decision.scheduled_at.isoformat()}, now={now.isoformat()}",
         )
 
-    try:
-        updated_case, audit_entries, executed = state_machine.attempt_execution(
-            case, decision, commit_backend, config, clock
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    effect = {
+        "case_id": case_id,
+        "attempt": decision.attempt_number,
+        "to_state": "RETRY_EXECUTED",
+        "at": clock.now().isoformat(),
+    }
 
-    if not executed:
+    committed = commit_backend.commit_effect(case_id, decision.attempt_number, effect)
+
+    if not committed:
+        # Another worker already committed; heal our local case state if needed
+        reconcile_case(case_id)
         raise HTTPException(status_code=409, detail="Commit backend rejected execution (duplicate?)")
 
-    store.update_case(updated_case)
-    for entry in audit_entries:
-        store.append_audit(entry)
+    # Apply effect locally (idempotent)
+    apply_effect(case, effect)
     store.update_retry_decision(decision)
 
-    return {"status": "ok", "case_id": updated_case.case_id, "state": updated_case.state}
+    return {"status": "ok", "case_id": case.case_id, "state": case.state}
 
 
-@app.post("/admin/advance-clock")
+@app.post("/admin/advance-clock", dependencies=[Depends(require_admin_token)])
 def advance_clock(hours: float = 0, minutes: float = 0, seconds: float = 0) -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
@@ -445,7 +565,7 @@ class SimulateSuccessRequest(BaseModel):
     notes: dict | None = None
 
 
-@app.post("/admin/simulate-success")
+@app.post("/admin/simulate-success", dependencies=[Depends(require_admin_token)])
 def simulate_success(req: SimulateSuccessRequest) -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Simulation endpoints are demo-only")
@@ -480,7 +600,7 @@ def simulate_success(req: SimulateSuccessRequest) -> dict:
     return {"status": "ok", "case_id": updated_case.case_id, "state": updated_case.state}
 
 
-@app.post("/admin/release-throttles")
+@app.post("/admin/release-throttles", dependencies=[Depends(require_admin_token)])
 def release_throttles() -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
@@ -500,7 +620,7 @@ class ResolveEscalationRequest(BaseModel):
     resolution_note: str  # "written_off" or "recovered_manually"
 
 
-@app.post("/admin/escalations/{case_id}/resolve")
+@app.post("/admin/escalations/{case_id}/resolve", dependencies=[Depends(require_admin_token)])
 def resolve_escalation(case_id: str, req: ResolveEscalationRequest) -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Admin endpoints are demo-only")
@@ -529,6 +649,37 @@ def resolve_escalation(case_id: str, req: ResolveEscalationRequest) -> dict:
     return {"status": "ok", "case_id": case.case_id, "state": case.state}
 
 
+@app.post("/admin/record-failure/{instrument_id}", dependencies=[Depends(require_admin_token)])
+def record_failure(instrument_id: str) -> dict:
+    now = clock.now()
+    distress_detector.record_failure(instrument_id, now)
+    return {
+        "instrument_id": instrument_id,
+        "failure_count": distress_detector.failure_count(instrument_id, now),
+        "distressed": distress_detector.is_distressed(instrument_id, now),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Advisory endpoints (no auth; read-only)
+# ---------------------------------------------------------------------------
+@app.get("/bandit/suggest")
+def bandit_suggest() -> dict:
+    slot = slot_bandit.suggest()
+    return {
+        "suggested_slot": slot,
+        "estimated_success_rate": slot_bandit.estimated_success_rate(slot),
+    }
+
+
+@app.get("/survival/recovery_curve")
+def survival_recovery_curve(reason_code: str, max_hours: float = 72) -> dict:
+    return {
+        "reason_code": reason_code,
+        "curve": survival_curve(reason_code, max_hours),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Compliance check (public oracle)
 # ---------------------------------------------------------------------------
@@ -545,12 +696,15 @@ def compliance_check(req: ComplianceCheckRequest) -> dict:
     now = clock.now()
     next_eligible = now + config.npci_rules.notice_lead_time if retryable else None
 
-    # Build a reasoning string with concrete config values
+    best_rail = max(config.rails, key=config.rails.get)
+    suggested_rail = best_rail
+
     reasoning_parts = [
         f"notice_lead_time={config.npci_rules.notice_lead_time}",
-        f"spacing={[str(s) for s in config.npci_rules.spacing]}",
+        f"retry_spacing={[str(s) for s in config.self_imposed.retry_spacing]}",
         f"peak_windows={[f'{w.start}-{w.end}' for w in config.npci_rules.peak_windows]}",
         f"afa_ceiling={config.npci_rules.afa_free_ceiling} paise",
+        f"rails_advisory={config.rails}",
     ]
     reasoning = "; ".join(reasoning_parts)
 
@@ -560,8 +714,23 @@ def compliance_check(req: ComplianceCheckRequest) -> dict:
         "advisory_technical_probability": advisory_prob,
         "rule_citation": "NPCI pre-debit notice lead time, spacing, peak-hour blackout, AFA ceiling (config/npci_rules.yaml)",
         "reasoning": reasoning,
+        "suggested_rail": suggested_rail,
+        "suggested_rail_advisory": True,
+        "note": "suggested_rail is config-driven and has no real multi-rail data behind it",
         "next_eligible_at": next_eligible.isoformat() if next_eligible else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Decline proposal (read-only, advisory)
+# ---------------------------------------------------------------------------
+@app.post("/decline/propose")
+def propose_decline(reason_code: str, error_reason: Optional[str] = None) -> dict:
+    from app.explain.decline_proposer import propose_classification
+    proposal = propose_classification(reason_code, error_reason)
+    proposal["advisory"] = True
+    proposal["note"] = "For manual review only; not used in automated decisions."
+    return proposal
 
 
 # ---------------------------------------------------------------------------
@@ -632,21 +801,18 @@ def verify_case(case_id: str) -> dict:
 
 @app.get("/cases/{case_id}/verify_chain")
 def verify_chain(case_id: str) -> dict:
-    """Independently verify the Merkle chain of audit entries for a case."""
     audit = store.get_audit_trail(case_id)
     if not audit:
         return {"case_id": case_id, "valid": False, "detail": "No audit entries"}
 
     prev_hash = None
     for entry in audit:
-        # Recompute expected previous hash
         if entry.prev_hash != prev_hash:
             return {
                 "case_id": case_id,
                 "valid": False,
                 "detail": f"Chain break at sequence {entry.sequence_id}: expected prev {prev_hash}, got {entry.prev_hash}",
             }
-        # Recompute entry hash
         serialized = json.dumps({
             "case_id": entry.case_id,
             "from_state": entry.from_state,
@@ -669,6 +835,25 @@ def verify_chain(case_id: str) -> dict:
         prev_hash = entry.entry_hash
 
     return {"case_id": case_id, "valid": True, "detail": "Chain intact"}
+
+
+# ---------------------------------------------------------------------------
+# Case explanation (read-only, optional LLM)
+# ---------------------------------------------------------------------------
+@app.get("/cases/{case_id}/explain")
+def explain_case(case_id: str, question: str = "Why is this case in its current state?") -> dict:
+    audit = store.get_audit_trail(case_id)
+    if not audit:
+        return {"case_id": case_id, "explanation": "No audit entries available."}
+
+    from app.explain.llm_explainer import explain_case as _explain
+    explanation = _explain(audit)
+    return {
+        "case_id": case_id,
+        "question": question,
+        "explanation": explanation,
+        "note": "Read-only explainer, grounded in audit trail. LLM may be used if configured.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -763,7 +948,7 @@ def dashboard_page() -> str:
 # ---------------------------------------------------------------------------
 # Chaos / cluster
 # ---------------------------------------------------------------------------
-@app.post("/admin/chaos/kill-leader")
+@app.post("/admin/chaos/kill-leader", dependencies=[Depends(require_admin_token)])
 def chaos_kill_leader() -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Chaos endpoints are demo-only")
@@ -778,7 +963,7 @@ def chaos_kill_leader() -> dict:
     return {"status": "simulated", "message": "Leader kill simulated; new leader would be elected."}
 
 
-@app.post("/admin/chaos/spike")
+@app.post("/admin/chaos/spike", dependencies=[Depends(require_admin_token)])
 def chaos_spike() -> dict:
     if config.profile_name != "demo":
         raise HTTPException(status_code=403, detail="Chaos endpoints are demo-only")
@@ -807,3 +992,38 @@ def cluster_status() -> dict:
         "leader": "etcd1",
         "using_real_etcd": False,
     }
+
+
+@app.get("/cluster", response_class=HTMLResponse)
+def cluster_page() -> str:
+    return """
+    <html>
+      <head>
+        <title>Cluster Status</title>
+        <script>
+          async function refresh() {
+            const res = await fetch('/cluster/status');
+            const data = await res.json();
+            const ul = document.getElementById('nodes');
+            ul.innerHTML = '';
+            data.nodes.forEach(node => {
+              const li = document.createElement('li');
+              li.textContent = `${node.name} (id: ${node.id})`;
+              if (data.leader === node.name) {
+                li.style.fontWeight = 'bold';
+                li.style.color = 'green';
+                li.textContent += ' ★ LEADER';
+              }
+              ul.appendChild(li);
+            });
+          }
+          setInterval(refresh, 1000);
+          window.onload = refresh;
+        </script>
+      </head>
+      <body>
+        <h1>etcd Cluster Leader</h1>
+        <ul id="nodes"></ul>
+      </body>
+    </html>
+    """

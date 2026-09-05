@@ -254,7 +254,9 @@ def test_invariant_2_retry_spacing_respects_executed_at(prev_executed_at, retrie
         previous_executed_at=prev_executed_at,
     )
 
-    required_spacing = config.npci_rules.spacing[min(retries_used, len(config.npci_rules.spacing)-1)]
+    required_spacing = config.self_imposed.retry_spacing[
+    min(retries_used, len(config.self_imposed.retry_spacing) - 1)
+]
     assert scheduled_at >= prev_executed_at + required_spacing
 
 

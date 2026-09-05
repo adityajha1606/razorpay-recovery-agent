@@ -6,7 +6,7 @@ from datetime import timedelta, time
 
 import pytest
 
-from app.core.config import AppConfig, DeclineRules, NpciRules, PeakWindow, ProfileConfig
+from app.core.config import AppConfig, DeclineRules, NpciRules, PeakWindow, ProfileConfig, SelfImposedPolicy
 from app.core.decline_router import classify_failure
 
 
@@ -21,18 +21,26 @@ def _make_config(decline_rules: DeclineRules | None = None) -> AppConfig:
         npci_rules=NpciRules(
             max_retries=3,
             notice_lead_time=timedelta(hours=24),
-            spacing=(timedelta(hours=0), timedelta(hours=72), timedelta(hours=168)),
-            control_observation_window=timedelta(hours=72),
-            max_schedule_window=timedelta(hours=48),
             peak_windows=(
                 PeakWindow(start=time(10, 0), end=time(13, 0)),
                 PeakWindow(start=time(17, 0), end=time(21, 30)),
             ),
-            afa_free_ceiling=1500000,
+            afa_free_ceiling={
+                "default": 1500000,
+                "insurance": 10000000,
+                "mutual_fund": 10000000,
+                "credit_card_bill": 10000000,
+            },
+        ),
+        self_imposed=SelfImposedPolicy(
+            control_observation_window=timedelta(hours=72),
+            retry_spacing=(timedelta(hours=0), timedelta(hours=72), timedelta(hours=168)),
+            max_schedule_window=timedelta(hours=48),
         ),
         profile_name="prod",
         profile=ProfileConfig(time_scale=1),
         decline_rules=decline_rules,
+        rails={"upi": 0.65, "card": 0.70, "nach": 0.75},
     )
 
 
