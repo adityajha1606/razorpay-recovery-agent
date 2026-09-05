@@ -162,34 +162,55 @@ async def _periodic_throttle_release():
 
 
 def get_leader_name() -> Optional[str]:
+    """Return current etcd leader hostname by querying multiple nodes.
+
+    Tries each node in the cluster (etcd1, etcd2, etcd3) to tolerate transient
+    leader re-election. Returns the hostname of the leader, or None if all
+    attempts fail.
+    """
     if not USE_ETCD:
         return None
+
+    nodes = ["etcd1", "etcd2", "etcd3"]
+
+    # Build a map from etcd member ID to name (used later)
     try:
-        # Safely get members without crashing if etcd is down
         members = list(etcd_client.members)
         member_id_to_name = {str(m.id): m.name for m in members}
     except Exception as exc:
         logger.warning("Cannot get etcd members: %s", exc)
-        return None
+        member_id_to_name = {}
 
-    try:
-        result = subprocess.run(
-            [
-                "docker", "compose", "exec", "-T", "etcd1",
-                "etcdctl", "endpoint", "status", "--write-out=json", "--cluster",
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        statuses = json.loads(result.stdout)
-        leader_id = None
-        for status in statuses:
-            leader_id = status.get("Status", {}).get("leader")
-            if leader_id:
-                break
-        if leader_id:
-            return member_id_to_name.get(str(leader_id))
-    except Exception as exc:
-        logger.warning("Leader detection via etcdctl failed: %s", exc)
+    for node in nodes:
+        try:
+            result = subprocess.run(
+                [
+                    "docker", "compose", "exec", "-T", node,
+                    "etcdctl", "endpoint", "status", "--write-out=json", "--cluster",
+                ],
+                capture_output=True, text=True, check=True,
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+            )
+            statuses = json.loads(result.stdout)
+            for status in statuses:
+                leader_id = status.get("Status", {}).get("leader")
+                if leader_id:
+                    # leader_id is typically a member ID (string). Map it to name.
+                    leader_name = member_id_to_name.get(str(leader_id))
+                    if leader_name:
+                        return leader_name
+                    # Fallback: try to extract hostname from Endpoint field
+                    endpoint = status.get("Endpoint", "")
+                    if endpoint:
+                        # Endpoint like "http://etcd2:2379" -> "etcd2"
+                        host = endpoint.split("://")[-1].split(":")[0]
+                        return host
+        except Exception as exc:
+            logger.debug("Leader detection on %s failed: %s", node, exc)
+            continue
+
+    # If all attempts fail, return None
     return None
 
 
