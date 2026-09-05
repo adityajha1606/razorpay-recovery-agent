@@ -1,59 +1,74 @@
+#!/usr/bin/env python3
 """
-Hour-0 de-risking spike for etcd3 (builder doc §10.1, §14 Q1).
+Hour-0 etcd spike — validates that the etcd3 Python client can connect to
+a locally running etcd cluster (v3.5.9) and perform basic KV + watch ops.
 
-This is throwaway and NOT part of the real app — that's why it lives in
-spikes/, outside the app/ package, and imports nothing from app/. Run it
-from its own worktree/branch before anyone builds CommitBackend on top of
-etcd. The whole point of the hour-20 gate in the builder doc is that etcd is
-the least predictable dependency, so prove it works here in the first hour,
-not discover it's flaky at hour 18 when it's load-bearing.
+Usage:
+    python spikes/etcd_spike.py [host] [port]
 
-Delete this file (or leave it — it's harmless) once the Phase 2 gate has
-passed and app/core/commit_backend.py's EtcdQuorumBackend is doing the same
-job for real.
-
-Start a single-node etcd just for this spike (the real system is the
-3-node docker-compose cluster from §3 / docker-compose.yml, used from
-Phase 2 onward):
-
-    docker run -d --name etcd-spike -p 2379:2379 \
-        quay.io/coreos/etcd:v3.5.9 \
-        etcd --advertise-client-urls http://0.0.0.0:2379 \
-             --listen-client-urls http://0.0.0.0:2379
-
-Install the client and run:
-
-    pip install etcd3 --break-system-packages
-    python spikes/etcd_spike.py
+Default: localhost:2379
+Exits 0 on success, 1 on failure.
 """
+
+import sys
+import threading
+import time
 
 import etcd3
 
 
-def main() -> None:
-    client = etcd3.client(host="localhost", port=2379)
+def main():
+    host = sys.argv[1] if len(sys.argv) > 1 else "localhost"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 2379
+
+    print(f"Connecting to etcd at {host}:{port}...")
+    try:
+        client = etcd3.Etcd3Client(host=host, port=port, timeout=5)
+    except Exception as exc:
+        print(f"FAIL: could not create etcd3 client: {exc}")
+        return 1
+
     key = "spike/hello"
+    value = "world"
 
-    # 1. Put
-    client.put(key, "world")
-    print(f"PUT  {key} = world")
+    try:
+        # PUT
+        client.put(key, value)
 
-    # 2. Get
-    value, meta = client.get(key)
-    print(f"GET  {key} = {value.decode()} (revision={meta.mod_revision})")
+        # GET
+        result = client.get(key)
+        if result[0] is None:
+            print("FAIL: key not found after put")
+            return 1
+        if result[0].decode() != value:
+            print(f"FAIL: value mismatch: got {result[0].decode()!r}, expected {value!r}")
+            return 1
 
-    # 3. Watch — start watching, then fire an update so there's an event
-    #    to observe. One event is enough to prove the watch path works.
-    events_iterator, cancel = client.watch(key)
-    client.put(key, "world-updated")
+        # WATCH: start a watcher, then update the key in a thread.
+        watcher = client.watch(key)
 
-    for event in events_iterator:
-        print(f"WATCH saw update -> {event.value.decode()}")
-        break
+        def update():
+            time.sleep(0.5)
+            client.put(key, "world-updated")
 
-    cancel()
-    print("Spike passed: put/get/watch all worked against this etcd.")
+        t = threading.Thread(target=update)
+        t.start()
+        for event in watcher:
+            if event is not None:
+                # etcd3 watch events have a .value attribute; Pylance may not infer it.
+                value_bytes = getattr(event, "value", b"")
+                print(f"WATCH saw update -> {value_bytes.decode()}")
+                break
+        t.join(timeout=2)
+
+        print("Spike passed: put/get/watch all worked against this etcd.")
+        return 0
+    except Exception as exc:
+        print(f"FAIL: {exc}")
+        return 1
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

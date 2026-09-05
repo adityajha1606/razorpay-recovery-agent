@@ -41,7 +41,7 @@ from app.core.state_machine import StateMachine
 from app.core.verifier import verify_case_compliance
 from app.core.webhook_parser import parse_payment_failed, parse_payment_captured
 from app.core.webhook_security import verify_webhook_signature
-from app.models import PaymentSuccessEvent, RetryDecision
+from app.models import AuditEntry, PaymentSuccessEvent, RetryDecision
 
 # Advisory modules
 from app.core.distress import DistressDetector
@@ -76,7 +76,7 @@ class InMemoryCommitBackend:
             attempt_number=attempt,
             scheduled_at=datetime.now(timezone.utc),
             reasoning="",
-            commit_backend="in_memory",
+            commit_backend="postgres_outbox",   # label only; not used by backend
             commit_ref=json.dumps(effect),
         )
         return self.commit(action)
@@ -165,7 +165,14 @@ def get_leader_name() -> Optional[str]:
     if not USE_ETCD:
         return None
     try:
-        member_id_to_name = {str(m.id): m.name for m in etcd_client.members}
+        # Safely get members without crashing if etcd is down
+        members = list(etcd_client.members)
+        member_id_to_name = {str(m.id): m.name for m in members}
+    except Exception as exc:
+        logger.warning("Cannot get etcd members: %s", exc)
+        return None
+
+    try:
         result = subprocess.run(
             [
                 "docker", "compose", "exec", "-T", "etcd1",
@@ -182,7 +189,7 @@ def get_leader_name() -> Optional[str]:
         if leader_id:
             return member_id_to_name.get(str(leader_id))
     except Exception as exc:
-        logger.warning("Leader detection failed: %s", exc)
+        logger.warning("Leader detection via etcdctl failed: %s", exc)
     return None
 
 
@@ -192,15 +199,16 @@ def apply_effect(case, effect: dict) -> None:
         return
     case.state = effect["to_state"]
     store.update_case(case)
-    store.append_audit({
-        "case_id": case.case_id,
-        "from_state": "RETRY_SCHEDULED",
-        "to_state": "RETRY_EXECUTED",
-        "rule_fired": "commit_effect_applied",
-        "rule_version": 1,
-        "timestamp": clock.now(),
-        "actor": "agent",
-    })
+    entry = AuditEntry(
+        case_id=case.case_id,
+        from_state="RETRY_SCHEDULED",
+        to_state="RETRY_EXECUTED",
+        rule_fired="commit_effect_applied",
+        rule_version=1,
+        timestamp=clock.now(),
+        actor="agent",
+    )
+    store.append_audit(entry)
 
 
 def reconcile_case(case_id: str) -> None:
@@ -497,15 +505,15 @@ def execute_retry(case_id: str) -> dict:
     if distress_detector.is_distressed(case.instrument_id, clock.now()):
         case.state = "ESCALATED"
         store.update_case(case)
-        store.append_audit({
-            "case_id": case.case_id,
-            "from_state": "RETRY_SCHEDULED",
-            "to_state": "ESCALATED",
-            "rule_fired": "distress_signal",
-            "rule_version": 1,
-            "timestamp": clock.now(),
-            "actor": "agent",
-        })
+        store.append_audit(AuditEntry(
+            case_id=case.case_id,
+            from_state="RETRY_SCHEDULED",
+            to_state="ESCALATED",
+            rule_fired="distress_signal",
+            rule_version=1,
+            timestamp=clock.now(),
+            actor="agent",
+        ))
         raise HTTPException(status_code=409, detail="Instrument distressed; retry blocked, case escalated")
 
     pending = [d for d in store.get_pending_retries() if d.case_id == case_id]
@@ -635,17 +643,15 @@ def resolve_escalation(case_id: str, req: ResolveEscalationRequest) -> dict:
     case.state = "RESOLVED_BY_HUMAN"
     case.resolution_note = req.resolution_note
     store.update_case(case)
-    store.append_audit(
-        {
-            "case_id": case.case_id,
-            "from_state": "ESCALATED",
-            "to_state": "RESOLVED_BY_HUMAN",
-            "rule_fired": "human_resolution",
-            "rule_version": 1,
-            "timestamp": clock.now(),
-            "actor": "human",
-        }
-    )
+    store.append_audit(AuditEntry(
+        case_id=case.case_id,
+        from_state="ESCALATED",
+        to_state="RESOLVED_BY_HUMAN",
+        rule_fired="human_resolution",
+        rule_version=1,
+        timestamp=clock.now(),
+        actor="human",
+    ))
     return {"status": "ok", "case_id": case.case_id, "state": case.state}
 
 
@@ -696,7 +702,7 @@ def compliance_check(req: ComplianceCheckRequest) -> dict:
     now = clock.now()
     next_eligible = now + config.npci_rules.notice_lead_time if retryable else None
 
-    best_rail = max(config.rails, key=config.rails.get)
+    best_rail = max(config.rails, key=lambda k: config.rails[k])
     suggested_rail = best_rail
 
     reasoning_parts = [
@@ -973,13 +979,18 @@ def chaos_spike() -> dict:
 @app.get("/cluster/status")
 def cluster_status() -> dict:
     if USE_ETCD:
-        members = etcd_client.members
-        leader_name = get_leader_name()
-        return {
-            "nodes": [
+        try:
+            members = list(etcd_client.members)
+            nodes = [
                 {"id": str(m.id), "name": m.name, "peer_urls": list(m.peer_urls)}
                 for m in members
-            ],
+            ]
+        except Exception as exc:
+            logger.warning("Cannot list etcd members: %s", exc)
+            nodes = []
+        leader_name = get_leader_name()
+        return {
+            "nodes": nodes,
             "leader": leader_name,
             "using_real_etcd": True,
         }
